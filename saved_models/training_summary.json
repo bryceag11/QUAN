@@ -1,0 +1,7 @@
+{
+    "best_accuracy": 84.42,
+    "final_train_acc": 80.782,
+    "final_test_acc": 83.68,
+    "final_train_loss": 0.022643625107012875,
+    "final_test_loss": 0.4844081898133595
+}
