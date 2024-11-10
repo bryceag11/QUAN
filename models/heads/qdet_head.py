@@ -12,15 +12,66 @@ import torch
 import torch.nn as nn
 from torch.nn.init import constant_, xavier_uniform_
 
-from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
+from utils.ops import  dist2bbox, dist2rbox, make_anchors
+from quaternion.conv import QConv2d  # Import Quaternion-aware Conv layer
+from quaternion.qactivation import QReLU  # Import Quaternion-aware activation
+from quaternion.qbatch_norm import QBN  # Import Quaternion-aware BatchNorm
 
-from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
-from .conv import Conv, DWConv
-from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
-from .utils import bias_init_with_prob, linear_init
+__all__ = ["Detect", "OBB", "Classify", "v10Detect"]
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+class QDetectHead(nn.Module):
+    """
+    Quaternion-aware Detection Head for OBB.
+    Replaces standard Conv2d with QConv2d to maintain quaternion structure.
+    """
+    def __init__(self, nc, ch, reg_max=16, param=None, **kwargs):
+        """
+        Initialize the QDetectHead.
 
+        Args:
+            nc (int): Number of classes.
+            ch (list or tuple): List of input channel sizes.
+            reg_max (int): Maximum value for distribution focal loss.
+            param (optional): Additional parameter for configuration flexibility.
+        """
+        super().__init__()
+        self.nc = nc
+        self.ch = ch
+        self.reg_max = reg_max
+        self.param = param  # Store param if needed for any adjustments
+        self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
+
+        # Example architecture; adjust as needed
+        self.conv1 = QConv2d(ch[0], 256, kernel_size=3, stride=1, padding=1)
+        self.bn1 = QBN(256)
+        self.act1 = QReLU()
+
+        self.conv2 = QConv2d(256, 256, kernel_size=3, stride=1, padding=1)
+        self.bn2 = QBN(256)
+        self.act2 = QReLU()
+
+        self.conv_final = QConv2d(256, self.no, kernel_size=1, stride=1)
+
+    def forward(self, x):
+        """
+        Forward pass through the detection head.
+
+        Args:
+            x (torch.Tensor): Input tensor, shape (B, C, H, W)
+
+        Returns:
+            torch.Tensor: Output tensor containing class scores, bbox distributions, and quaternions.
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.act2(x)
+
+        x = self.conv_final(x)  # Shape: (B, no, H, W)
+        return x
 
 class Detect(nn.Module):
     """YOLO Detect head for detection models."""
@@ -169,36 +220,57 @@ class Detect(nn.Module):
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
 
-
-class OBB(Detect):
-    """YOLO OBB detection head for detection with rotation models."""
-
-    def __init__(self, nc=80, ne=1, ch=()):
-        """Initialize OBB with number of classes `nc` and layer channels `ch`."""
-        super().__init__(nc, ch)
-        self.ne = ne  # number of extra parameters
-
-        c4 = max(ch[0] // 4, self.ne)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.ne, 1)) for x in ch)
-
+class QOBBHead(nn.Module):
+    """
+    Quaternion-aware Oriented Bounding Box Head.
+    Outputs bounding box coordinates and quaternion orientations.
+    """
+    def __init__(self, nc, ch, reg_max=16):
+        """
+        Initialize the QOBBHead.
+        
+        Args:
+            nc (int): Number of classes.
+            ch (list or tuple): List of input channel sizes.
+            reg_max (int): Maximum value for distribution focal loss.
+        """
+        super().__init__()
+        self.nc = nc
+        self.ch = ch
+        self.reg_max = reg_max
+        self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
+        
+        # Example architecture; adjust as needed
+        self.conv1 = QConv2d(ch[0], 256, kernel_size=3, stride=1, padding=1)
+        self.act1 = QReLU()
+        self.bn1 = QBN(256)
+        
+        self.conv2 = QConv2d(256, 256, kernel_size=3, stride=1, padding=1)
+        self.act2 = QReLU()
+        self.bn2 = QBN(256)
+        
+        self.conv_final = QConv2d(256, self.no, kernel_size=1, stride=1)
+    
     def forward(self, x):
-        """Concatenates and returns predicted bounding boxes and class probabilities."""
-        bs = x[0].shape[0]  # batch size
-        angle = torch.cat([self.cv4[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2)  # OBB theta logits
-        # NOTE: set `angle` as an attribute so that `decode_bboxes` could use it.
-        angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
-        # angle = angle.sigmoid() * math.pi / 2  # [0, pi/2]
-        if not self.training:
-            self.angle = angle
-        x = Detect.forward(self, x)
-        if self.training:
-            return x, angle
-        return torch.cat([x, angle], 1) if self.export else (torch.cat([x[0], angle], 1), (x[1], angle))
-
-    def decode_bboxes(self, bboxes, anchors):
-        """Decode rotated bounding boxes."""
-        return dist2rbox(bboxes, self.angle, anchors, dim=1)
-
+        """
+        Forward pass through the OBB head.
+        
+        Args:
+            x (torch.Tensor): Input tensor, shape (B, C, H, W)
+        
+        Returns:
+            torch.Tensor: Output tensor containing class scores, bbox distributions, and quaternions.
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.act1(x)
+        
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.act2(x)
+        
+        x = self.conv_final(x)  # Shape: (B, no, H, W)
+        return x
 
 class Classify(nn.Module):
     """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""
@@ -206,18 +278,25 @@ class Classify(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
         """Initializes YOLO classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape."""
         super().__init__()
-        c_ = 1280  # efficientnet_b0 size
-        self.conv = Conv(c1, c_, k, s, p, g)
+        c_ = 1280  # EfficientNet-B0 size, ensure it's divisible by 4
+        self.conv = QConv2d(c1, c_, kernel_size=k, stride=s, padding=p, groups=g)
+        self.bn = QBatchNorm2d(c_)
+        self.act = QReLU()
         self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
         self.drop = nn.Dropout(p=0.0, inplace=True)
         self.linear = nn.Linear(c_, c2)  # to x(b,c2)
 
     def forward(self, x):
-        """Performs a forward pass of the YOLO model on input image data."""
+        """Performs a forward pass of the YOLO classification head on input quaternion data."""
         if isinstance(x, list):
-            x = torch.cat(x, 1)
-        x = self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
-        return x if self.training else x.softmax(1)
+            x = torch.cat(x, dim=1)  # Concatenate along channel dimension
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        x = self.pool(x).flatten(1)  # Shape: (B, c_)
+        x = self.drop(x)
+        x = self.linear(x)  # Shape: (B, c2)
+        return x if self.training else x.softmax(dim=1)
 
 
 class v10Detect(Detect):

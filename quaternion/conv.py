@@ -44,10 +44,6 @@ class QConv(nn.Module):
         
         # Create weight parameters
         kernel_shape = (self.out_channels, self.in_channels) + self.kernel_size
-        
-        # Initialize phase weights
-        phase = torch.empty(kernel_shape, device=device, dtype=dtype)
-        self.phase = nn.Parameter(torch.nn.init.uniform_(phase, -np.pi, np.pi))
 
         # Initialize modulus weights
         fan_in = self.in_channels * np.prod(self.kernel_size)
@@ -55,17 +51,27 @@ class QConv(nn.Module):
         bound = 1 / math.sqrt(fan_in)
         self.modulus = nn.Parameter(torch.nn.init.uniform_(modulus, -bound, bound))
 
+        # Initialize phase weights
+        phase = torch.empty(kernel_shape, device=device, dtype=dtype)
+        self.phase = nn.Parameter(torch.nn.init.uniform_(phase, -np.pi, np.pi))
+
         # Initialize bias
         if bias:
             self.bias = nn.Parameter(torch.zeros(self.out_channels, device=device, dtype=dtype))
         else:
             self.register_parameter('bias', None)
 
-    def _normalize_tuple(self, value, rank, name):
+    @staticmethod
+    def _normalize_tuple(value, rank, name):
+        """
+        Normalize input to a tuple.
+        """
         if isinstance(value, int):
             return (value,) * rank
+        elif isinstance(value, tuple) and len(value) == rank:
+            return value
         else:
-            return tuple(value)
+            raise ValueError(f"Invalid {name}. Expected an int or a tuple of length {rank}.")
 
     def _get_padding(self, input_size):
         if isinstance(self.padding, str) and self.padding.lower() == 'same':
@@ -90,33 +96,27 @@ class QConv(nn.Module):
             raise ValueError(f"Unsupported padding type: {self.padding}")
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        # Compute the padding as needed
         padding = self._get_padding(input.shape)
         
         if isinstance(padding, tuple) and len(padding) > 2:
             input = F.pad(input, padding, mode=self.padding_mode, value=0)
             padding = 0
 
-        # Get quaternion components
+        # Generate quaternion weights
         cos_weights = torch.cos(self.phase)
         sin_weights = torch.sin(self.phase)
-
-        # Create quaternion weights
         real_weight = cos_weights * self.modulus
         imag_weight = sin_weights * self.modulus
 
-        # Perform convolution
-        if self.rank == 1:
-            conv_fn = F.conv1d
-        elif self.rank == 2:
-            conv_fn = F.conv2d
-        else:  # rank == 3
-            conv_fn = F.conv3d
+        # Choose convolution function based on rank
+        conv_fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self.rank]
 
-        # Convolve input with real and imaginary weights
+        # Perform quaternion convolution
         output_real = conv_fn(input, real_weight, None, self.strides, padding, self.dilation, self.groups)
         output_imag = conv_fn(input, imag_weight, None, self.strides, padding, self.dilation, self.groups)
 
-        # Combine outputs according to quaternion algebra
+        # Combine real and imaginary outputs according to quaternion algebra
         output = output_real - output_imag
 
         # Add bias if it exists
@@ -206,7 +206,6 @@ class QConv3d(QConv):
             device=device,
             dtype=dtype)
         
-
 class QDense(nn.Module):
     """
     Quaternion Dense (fully connected) layer.
@@ -280,3 +279,4 @@ class QDense(nn.Module):
     def extra_repr(self) -> str:
         """Return a string representation of layer parameters."""
         return f'in_features={self.in_features * 3}, out_features={self.units * 3}, bias={self.bias is not None}'
+    

@@ -1,0 +1,21 @@
+# configs/default.yaml
+
+datasets:
+  DOTA:
+    train:
+      img_dir: 'data/DOTA/train/images/'
+      ann_file: 'data/DOTA/train/annotations/dota_train.json'  # Ensure this is the converted OBB annotations
+    val:
+      img_dir: 'data/DOTA/val/images/'
+      ann_file: 'data/DOTA/val/annotations/dota_val.json'      # Ensure this is the converted OBB annotations
+
+  COCO2017:
+    train:
+      img_dir: 'data/coco2017/train2017/'
+      ann_file: 'data/coco2017/annotations/instances_train2017.json'
+    val:
+      img_dir: 'data/coco2017/val2017/'
+      ann_file: 'data/coco2017/annotations/instances_val2017.json'
+
+# Specify which dataset to use
+active_dataset: 'COCO2017'  # Change to 'COCO' as needed

@@ -1,0 +1,19 @@
+displayName: DOTA v1.0
+labelTypes:
+- Box2D
+- Polygon
+license:
+- DOTA_V1.0 Custom
+mediaTypes:
+- Image
+paperUrl: ""
+publishDate: "2018-01-01"
+publishUrl: https://captain-whu.github.io/DOTA/index.html
+publisher:
+- Wuhan University
+- Cornell University
+- Huazhong University of Science and Technology
+tags: []
+taskTypes:
+- Rotated-ObjectDetection
+‌​‌‌​​​​‌​​​‌‌‌‌‌​​‌‌​‌​‌​​‌​​​‌‌​‌‌‌​‌‌‌​​‌‌‌‌​‌​​​‌​‌‌‌​​‌‌‌‌​‌​‌‌​​‌‌‌​​‌‌‌‌​‌​​‌‌‌​‌

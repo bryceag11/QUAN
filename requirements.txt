@@ -1,0 +1,12 @@
+matplotlib 
+numpy
+opencv-python
+Pillow
+PyYAML
+requests
+scipy
+tqdm
+seaborn
+pandas
+thop
+shapely

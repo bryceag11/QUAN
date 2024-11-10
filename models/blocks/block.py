@@ -4,11 +4,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-
-
 from quaternion.conv import QConv, QConv1d, QConv2d, QConv3d
 from quaternion.qactivation import QHardTanh, QLeakyReLU, QuaternionActivation, QReLU, QPReLU, QREReLU, QSigmoid, QTanh
-
+from quaternion.qbatch_norm import QBN, IQBN, VQBN
 
 __all__ = (
     "QC1",
@@ -182,51 +180,56 @@ class InformationTheoreticQuaternionPool(nn.Module):
 
 class SPPF(nn.Module):
     """
-    Spatial Pyramid Pooling - Fast (SPPF) layer for quaternion neural networks.
+    Spatial Pyramid Pooling - Fast (QSPPF) layer for quaternion neural networks.
 
     This module applies a series of max pooling operations with the same kernel size
     and concatenates the results along the channel dimension, followed by a convolution
     to mix the features.
 
     Args:
-        c1 (int): Number of input channels (must be a multiple of 4).
-        c2 (int): Number of output channels (must be a multiple of 4).
-        k (int): Kernel size for max pooling. Defaults to 5.
+        in_channels (int): Number of input channels (must be a multiple of 4).
+        out_channels (int): Number of output channels (must be a multiple of 4).
+        kernel_size (int): Kernel size for max pooling. Defaults to 5.
     """
-    def __init__(self, c1: int, c2: int, k: int =5):
-        """
-        Initializes the SPPF layer with given input/output channels and kernel size.
-
-        This module is equivalent to SPP(k=(5, 5, 5, 5)).
-
-        Args:
-            c1 (int): Number of input channels (must be a multiple of 4).
-            c2 (int): Number of output channels (must be a multiple of 4).
-            k (int): Kernel size for max pooling. Defaults to 5.
-        """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5):
         super(SPPF, self).__init__()
-        assert c1 %4 ==0 and c2 %4 ==0, "Channels must be multiples of 4 for quaternions."
-        c_ = c1 // 2  # hidden channels
-        assert c_ %4 ==0, "Hidden channels must be a multiple of 4 for quaternions."
-        self.cv1 = QConv2d(c1, c_, kernel_size=1, stride=1, padding=0, bias=False)
-        self.cv2 = QConv2d(c_ *4, c2, kernel_size=1, stride=1, padding=0, bias=False)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k//2)
-    
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4 for quaternions."
+        
+        # Set up intermediate channels (half of in_channels), ensuring they are a multiple of 4
+        c_ = in_channels // 2
+        assert c_ % 4 == 0, "Hidden channels must be a multiple of 4 for quaternions."
+
+        # First convolution to reduce channel dimensionality
+        self.cv1 = QConv2d(in_channels, c_, kernel_size=1, stride=1, padding=0, bias=False)
+        
+        # Max pooling with kernel size and stride of 1
+        self.m = nn.MaxPool2d(kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+        
+        # Final convolution after concatenation to project back to out_channels
+        self.cv2 = QConv2d(c_ * 4, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the SPPF layer.
 
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C1, 4, H, W).
+            x (torch.Tensor): Input tensor of shape (B, in_channels, 4, H, W).
 
         Returns:
-            torch.Tensor: Output tensor of shape (B, C2, 4, H, W).
+            torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W).
         """
-        y = [self.cv1(x)]  # Shape: (B, c_, 4, H, W)
+        # Initial convolution
+        y = self.cv1(x)  # Shape: (B, c_, 4, H, W)
+        
+        # Apply three max pooling layers and concatenate outputs
+        pooled_outputs = [y]  # Initialize with first convolution output
         for _ in range(3):
-            y.append(self.m(y[-1]))  # Apply max pooling
-        y = torch.cat(y, dim=1)  # Concatenate along channel dimension: (B, 4*c_, 4, H, W)
-        y = self.cv2(y)  # Project to c2 channels: (B, c2, 4, H, W)
+            pooled_outputs.append(self.m(pooled_outputs[-1]))  # Max pooling
+        
+        # Concatenate along channel dimension and apply final convolution
+        y = torch.cat(pooled_outputs, dim=1)  # Shape: (B, 4 * c_, 4, H, W)
+        y = self.cv2(y)  # Project to out_channels: (B, out_channels, 4, H, W)
+        
         return y
 
 # Quaternion CSP Bottleneck (QC1)
@@ -643,43 +646,37 @@ class CBFuse(nn.Module):
         return fused
 
 class C3k2(nn.Module):
-    """
-    Quaternion C3k2 module with customizable attention mechanisms.
-    
-    Extends the C2f module by incorporating either C3k or Quaternion Bottleneck blocks based on the c3k flag.
-    
-    Args:
-        c1 (int): Number of input channels (must be a multiple of 4).
-        c2 (int): Number of output channels (must be a multiple of 4).
-        n (int): Number of blocks to stack.
-        c3k (bool): Flag to determine whether to use C3k blocks.
-        e (float): Expansion ratio for hidden channels.
-        g (int): Number of groups for convolution.
-        shortcut (bool): Whether to include residual connections.
-    """
-    def __init__(self, c1: int, c2: int, n: int =1, c3k: bool =False, e: float=0.5, g: int =1, shortcut: bool =True):
+
+    def __init__(self, in_channels: int, out_channels: int, n: int = 1, e: float = 0.5, g: int = 1, shortcut: bool = True, **kwargs):
+        """
+        Initializes the C3k2 module with specified channels and configurations.
+
+        Args:
+            in_channels (int): Number of input channels.
+            out_channels (int): Number of output channels.
+            n (int): Number of repeats for the module.
+            e (float): Expansion rate or ratio.
+            g (int): Group convolution factor.
+            shortcut (bool): Whether to include a shortcut connection.
+            **kwargs: Additional arguments for flexibility, ignored if unused.
+        """
         super(C3k2, self).__init__()
-        assert c1 %4 ==0 and c2 %4 ==0, "Channels must be multiples of 4 for quaternions."
-        self.c = int(c2 * e)
-        self.c = (self.c //4 ) *4  # Ensure multiple of 4
-        
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4 for quaternions."
+        self.c = int(out_channels * e)
+        self.c = (self.c // 4) * 4  # Ensure multiple of 4
+
         # Initial convolutions
-        self.cv1 = QConv2d(c1, self.c, kernel_size=1, stride=1, padding=0, bias=False)
-        self.cv2 = QConv2d(c1, self.c, kernel_size=1, stride=1, padding=0, bias=False)
-        
-        # Sequential blocks: C3k or QBottleneck
-        if c3k:
-            self.m = nn.Sequential(*[
-                C3k(c1=self.c, c2=self.c, n=2, shortcut=shortcut, g=g, e=1.0, k=3) for _ in range(n)
-            ])
-        else:
-            self.m = nn.Sequential(*[
-                QBottleneck(in_channels=self.c, out_channels=self.c, shortcut=shortcut, groups=g, expansion=1.0) for _ in range(n)
-            ])
-        
+        self.cv1 = QConv2d(in_channels, self.c, kernel_size=1, stride=1, padding=0, bias=False)
+        self.cv2 = QConv2d(in_channels, self.c, kernel_size=1, stride=1, padding=0, bias=False)
+
+        # Sequential blocks: either C3k or QBottleneck based on kwargs
+        self.m = nn.Sequential(*[
+            QBottleneck(in_channels=self.c, out_channels=self.c, shortcut=shortcut, groups=g, expansion=1.0) for _ in range(n)
+        ])
+
         # Final convolution
-        self.cv3 = QConv2d((2 + n) * self.c, c2, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn3 = IQBN(c2)
+        self.cv3 = QConv2d((2 + n) * self.c, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn3 = IQBN(out_channels)
         self.act3 = QReLU()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -700,7 +697,7 @@ class C3k2(nn.Module):
             y.append(m(y[-1]))
         
         # Concatenate all processed features
-        out = torch.cat(y, dim=1)  # Shape: (B, 2 + n) * c, 4, H, W)
+        out = torch.cat(y, dim=1)  # Shape: (B, (2 + n) * c, 4, H, W)
         
         # Final convolution
         out = self.cv3(out)
@@ -708,6 +705,7 @@ class C3k2(nn.Module):
         out = self.act3(out)
         
         return out
+
 
 class C3k(nn.Module):
     """
@@ -1075,82 +1073,75 @@ class PSA(nn.Module):
         
         return out
 
+
 class C2PSA(nn.Module):
     """
-    C2PSA module with attention mechanism for enhanced feature extraction and processing in quaternion neural networks.
-    
-    Incorporates multiple PSABlock instances within a CSP Bottleneck structure.
+    C2PSA module with attention mechanism for enhanced feature extraction in quaternion neural networks.
     
     Args:
-        c1 (int): Number of input channels (must be a multiple of 4).
-        c2 (int): Number of output channels (must be a multiple of 4).
-        n (int): Number of PSABlock instances to stack.
+        in_channels (int): Number of input channels (must be a multiple of 4).
+        out_channels (int): Number of output channels (must be a multiple of 4).
+        n (int): Number of PSABlock instances.
         e (float): Expansion ratio for hidden channels.
         g (int): Number of groups for grouped convolutions.
         shortcut (bool): Whether to include residual connections.
     """
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, g: int = 1, shortcut: bool = True):
+    def __init__(self, in_channels: int, out_channels: int, n: int = 1, e: float = 0.5, g: int = 1, shortcut: bool = True):
         super(C2PSA, self).__init__()
-        assert c1 % 4 == 0 and c2 % 4 == 0, "Input and output channels must be multiples of 4."
-        
-        self.c = int(c2 * e)
-        self.c = (self.c // 4) * 4  # Ensure hidden channels are multiples of 4
-        assert self.c > 0, "Hidden channels must be positive and a multiple of 4."
-        
-        # Quaternion-aware convolution to reduce channels
-        self.cv1 = QConv2d(c1, 2 * self.c, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn1 = IQBN(2 * self.c)
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4."
+
+        self.hidden_channels = int(out_channels * e)
+        self.hidden_channels = (self.hidden_channels // 4) * 4  # Ensure multiple of 4
+        assert self.hidden_channels > 0, "Hidden channels must be a positive multiple of 4."
+
+        # Initial quaternion convolution for channel reduction
+        self.cv1 = QConv2d(in_channels, 2 * self.hidden_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn1 = IQBN(2 * self.hidden_channels)
         self.act1 = QReLU()
-        
-        # PSABlock instances
-        self.m = nn.Sequential(*[
-            PSABlock(c=self.c, attn_ratio=1.0, num_heads=self.c // (4 * 4), shortcut=shortcut) for _ in range(n)
-        ])
-        
-        # Quaternion-aware attention block
-        self.attn = MaxSigmoidAttnBlock(self.c, self.c, gc=gc, ec=ec, nh=nh)
-        
-        # Final convolution to restore channels
-        self.cv2 = QConv2d((3 + n) * self.c, c2, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn2 = IQBN(c2)
+
+        # Stack of PSABlock instances
+        self.m = nn.Sequential(*[PSABlock(c=self.hidden_channels, attn_ratio=1.0, num_heads=self.hidden_channels // 16, shortcut=shortcut) for _ in range(n)])
+
+        # Quaternion attention block (ensure gc, ec, nh are defined or pass as init arguments)
+        self.attn = MaxSigmoidAttnBlock(self.hidden_channels, self.hidden_channels)
+
+        # Final quaternion convolution to restore channels
+        self.cv2 = QConv2d((2 + n) * self.hidden_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn2 = IQBN(out_channels)
         self.act2 = QReLU()
-        
-    def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+
+    def forward(self, x: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass through C2PSA layer.
+        Forward pass through the C2PSA module.
         
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C1, 4, H, W).
-            guide (torch.Tensor): Guide tensor for attention mechanism.
+            x (torch.Tensor): Input tensor of shape (B, in_channels, 4, H, W).
+            guide (Optional[torch.Tensor]): Optional guide tensor for attention.
         
         Returns:
-            torch.Tensor: Output tensor of shape (B, C2, 4, H, W).
+            torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W).
         """
-        # Initial convolution, normalization, and activation
-        y = self.cv1(x)
-        y = self.bn1(y)
-        y = self.act1(y)
-        
-        # Split into 'a' and 'b'
-        y = y.chunk(2, dim=1)  # Each has channels = self.c
-        
+        # Initial conv-bn-activation
+        y = self.act1(self.bn1(self.cv1(x)))
+
+        # Split into two branches
+        y_a, y_b = y.chunk(2, dim=1)
+
         # Pass through PSABlock instances
-        y = list(y)
-        y = self.m(y[-1])
-        y = [y]
-        
-        # Apply attention to the last PSABlock output
-        y.append(self.attn(y[-1], guide))
-        
-        # Concatenate all features
-        y = torch.cat(y, dim=1)  # Shape: (B, (1 + 1) * self.c, 4, H, W)
-        
-        # Final convolution, normalization, and activation
-        y = self.cv2(y)
-        y = self.bn2(y)
-        y = self.act2(y)
+        psablock_out = self.m(y_b)
+
+        # Apply attention
+        attn_out = self.attn(psablock_out, guide) if guide is not None else self.attn(psablock_out)
+
+        # Concatenate features
+        y = torch.cat([y_a, psablock_out, attn_out], dim=1)
+
+        # Final conv-bn-activation
+        y = self.act2(self.bn2(self.cv2(y)))
         
         return y
+
+
 
 class C2fPSA(nn.Module):
     """
