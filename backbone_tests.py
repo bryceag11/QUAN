@@ -144,7 +144,6 @@ def test_c2psa_fixed():
         import traceback
         traceback.print_exc()
         return False
-
 def run_all_tests():
     """Run all quaternion attention and C2PSA tests."""
     try:
