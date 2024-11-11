@@ -19,59 +19,150 @@ from quaternion.qbatch_norm import QBN  # Import Quaternion-aware BatchNorm
 
 __all__ = ["Detect", "OBB", "Classify", "v10Detect"]
 
-class QDetectHead(nn.Module):
-    """
-    Quaternion-aware Detection Head for OBB.
-    Replaces standard Conv2d with QConv2d to maintain quaternion structure.
-    """
-    def __init__(self, nc, ch, reg_max=16, param=None, **kwargs):
-        """
-        Initialize the QDetectHead.
 
-        Args:
-            nc (int): Number of classes.
-            ch (list or tuple): List of input channel sizes.
-            reg_max (int): Maximum value for distribution focal loss.
-            param (optional): Additional parameter for configuration flexibility.
-        """
+class QDetectHead(nn.Module):
+    """Quaternion-aware Detection Head for multiple feature levels."""
+    def __init__(self, nc, ch, reg_max=16, param=None, **kwargs):
         super().__init__()
         self.nc = nc
         self.ch = ch
         self.reg_max = reg_max
-        self.param = param  # Store param if needed for any adjustments
+        self.param = param
         self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
 
-        # Example architecture; adjust as needed
-        self.conv1 = QConv2d(ch[0], 256, kernel_size=3, stride=1, padding=1)
-        self.bn1 = QBN(256)
-        self.act1 = QReLU()
+        # Ensure channel counts are multiples of 4
+        self.hidden_dim = 256 - (256 % 4)  # Make sure hidden dimension is multiple of 4
 
-        self.conv2 = QConv2d(256, 256, kernel_size=3, stride=1, padding=1)
-        self.bn2 = QBN(256)
-        self.act2 = QReLU()
+        # Create detection head for each feature level
+        self.detect_layers = nn.ModuleList()
+        for channels in ch:
+            assert channels % 4 == 0, f"Input channels must be multiple of 4, got {channels}"
+            head = nn.Sequential(
+                # First conv block
+                QConv2d(channels, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QBN(self.hidden_dim),
+                QReLU(),
+                
+                # Second conv block
+                QConv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QBN(self.hidden_dim),
+                QReLU(),
+                
+                # Final conv to get outputs
+                QConv2d(self.hidden_dim, self.no, kernel_size=1, stride=1)
+            )
+            self.detect_layers.append(head)
 
-        self.conv_final = QConv2d(256, self.no, kernel_size=1, stride=1)
-
-    def forward(self, x):
+    def forward(self, features):
         """
         Forward pass through the detection head.
 
         Args:
-            x (torch.Tensor): Input tensor, shape (B, C, H, W)
+            features (List[torch.Tensor]): List of input feature maps [P3, P4, P5]
+                Each with shape (B, C, 4, H, W) for quaternion features
 
         Returns:
-            torch.Tensor: Output tensor containing class scores, bbox distributions, and quaternions.
+            List[torch.Tensor]: List of detection outputs for each feature level,
+                each with shape (B, no, 4, H, W)
         """
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
+        outputs = []
+        for feature, layer in zip(features, self.detect_layers):
+            # Verify input shape
+            B, C, quat_dim, H, W = feature.shape
+            assert quat_dim == 4, f"Expected quaternion dimension to be 4, got {quat_dim}"
+            assert C % 4 == 0, f"Channel dimension must be multiple of 4, got {C}"
+            
+            # Process through detection head
+            out = layer(feature)
+            outputs.append(out)
+            
+        return outputs
 
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.act2(x)
+class QOBBHead(nn.Module):
+    """Quaternion-aware Oriented Bounding Box Head for multiple feature levels."""
+    def __init__(self, nc, ch, reg_max=16):
+        super().__init__()
+        self.nc = nc
+        self.ch = ch
+        self.reg_max = reg_max
+        self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
+        
+        # Ensure channel counts are multiples of 4
+        self.hidden_dim = 256 - (256 % 4)  # Make sure hidden dimension is multiple of 4
+        
+        # Create OBB head for each feature level
+        self.detect_layers = nn.ModuleList()
+        for channels in ch:
+            assert channels % 4 == 0, f"Input channels must be multiple of 4, got {channels}"
+            head = nn.Sequential(
+                # First conv block
+                QConv2d(channels, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QBN(self.hidden_dim),
+                QReLU(),
+                
+                # Second conv block
+                QConv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QBN(self.hidden_dim),
+                QReLU(),
+                
+                # Final conv to get outputs
+                QConv2d(self.hidden_dim, self.no, kernel_size=1, stride=1)
+            )
+            self.detect_layers.append(head)
 
-        x = self.conv_final(x)  # Shape: (B, no, H, W)
-        return x
+    def forward(self, features):
+        """
+        Forward pass through the OBB head.
+
+        Args:
+            features (List[torch.Tensor]): List of input feature maps [P3, P4, P5]
+                Each with shape (B, C, 4, H, W) for quaternion features
+
+        Returns:
+            List[torch.Tensor]: List of OBB outputs for each feature level,
+                each with shape (B, no, 4, H, W)
+        """
+        outputs = []
+        for feature, layer in zip(features, self.detect_layers):
+            # Verify input shape
+            B, C, quat_dim, H, W = feature.shape
+            assert quat_dim == 4, f"Expected quaternion dimension to be 4, got {quat_dim}"
+            assert C % 4 == 0, f"Channel dimension must be multiple of 4, got {C}"
+            
+            # Process through OBB head
+            out = layer(feature)
+            outputs.append(out)
+            
+        return outputs
+
+
+class Classify(nn.Module):
+    """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
+        """Initializes YOLO classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape."""
+        super().__init__()
+        c_ = 1280  # EfficientNet-B0 size, ensure it's divisible by 4
+        self.conv = QConv2d(c1, c_, kernel_size=k, stride=s, padding=p, groups=g)
+        self.bn = QBatchNorm2d(c_)
+        self.act = QReLU()
+        self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
+        self.drop = nn.Dropout(p=0.0, inplace=True)
+        self.linear = nn.Linear(c_, c2)  # to x(b,c2)
+
+    def forward(self, x):
+        """Performs a forward pass of the YOLO classification head on input quaternion data."""
+        if isinstance(x, list):
+            x = torch.cat(x, dim=1)  # Concatenate along channel dimension
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        x = self.pool(x).flatten(1)  # Shape: (B, c_)
+        x = self.drop(x)
+        x = self.linear(x)  # Shape: (B, c2)
+        return x if self.training else x.softmax(dim=1)
+
+
 
 class Detect(nn.Module):
     """YOLO Detect head for detection models."""
@@ -219,85 +310,6 @@ class Detect(nn.Module):
         scores, index = scores.flatten(1).topk(min(max_det, anchors))
         i = torch.arange(batch_size)[..., None]  # batch indices
         return torch.cat([boxes[i, index // nc], scores[..., None], (index % nc)[..., None].float()], dim=-1)
-
-class QOBBHead(nn.Module):
-    """
-    Quaternion-aware Oriented Bounding Box Head.
-    Outputs bounding box coordinates and quaternion orientations.
-    """
-    def __init__(self, nc, ch, reg_max=16):
-        """
-        Initialize the QOBBHead.
-        
-        Args:
-            nc (int): Number of classes.
-            ch (list or tuple): List of input channel sizes.
-            reg_max (int): Maximum value for distribution focal loss.
-        """
-        super().__init__()
-        self.nc = nc
-        self.ch = ch
-        self.reg_max = reg_max
-        self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
-        
-        # Example architecture; adjust as needed
-        self.conv1 = QConv2d(ch[0], 256, kernel_size=3, stride=1, padding=1)
-        self.act1 = QReLU()
-        self.bn1 = QBN(256)
-        
-        self.conv2 = QConv2d(256, 256, kernel_size=3, stride=1, padding=1)
-        self.act2 = QReLU()
-        self.bn2 = QBN(256)
-        
-        self.conv_final = QConv2d(256, self.no, kernel_size=1, stride=1)
-    
-    def forward(self, x):
-        """
-        Forward pass through the OBB head.
-        
-        Args:
-            x (torch.Tensor): Input tensor, shape (B, C, H, W)
-        
-        Returns:
-            torch.Tensor: Output tensor containing class scores, bbox distributions, and quaternions.
-        """
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
-        
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.act2(x)
-        
-        x = self.conv_final(x)  # Shape: (B, no, H, W)
-        return x
-
-class Classify(nn.Module):
-    """YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)."""
-
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
-        """Initializes YOLO classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape."""
-        super().__init__()
-        c_ = 1280  # EfficientNet-B0 size, ensure it's divisible by 4
-        self.conv = QConv2d(c1, c_, kernel_size=k, stride=s, padding=p, groups=g)
-        self.bn = QBatchNorm2d(c_)
-        self.act = QReLU()
-        self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
-        self.drop = nn.Dropout(p=0.0, inplace=True)
-        self.linear = nn.Linear(c_, c2)  # to x(b,c2)
-
-    def forward(self, x):
-        """Performs a forward pass of the YOLO classification head on input quaternion data."""
-        if isinstance(x, list):
-            x = torch.cat(x, dim=1)  # Concatenate along channel dimension
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        x = self.pool(x).flatten(1)  # Shape: (B, c_)
-        x = self.drop(x)
-        x = self.linear(x)  # Shape: (B, c2)
-        return x if self.training else x.softmax(dim=1)
-
 
 class v10Detect(Detect):
     """

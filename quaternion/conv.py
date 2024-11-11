@@ -42,36 +42,60 @@ class QConv(nn.Module):
         }
         self.padding_mode = pad_mode_map.get(padding_mode, 'constant')
         
-        # Create weight parameters
-        kernel_shape = (self.out_channels, self.in_channels) + self.kernel_size
+        # Create weight parameters - ensure proper shape for convolution
+        if rank == 1:
+            kernel_shape = (out_channels, in_channels // groups, self.kernel_size[0])
+        elif rank == 2:
+            kernel_shape = (out_channels, in_channels // groups, *self.kernel_size)
+        else:  # rank == 3
+            kernel_shape = (out_channels, in_channels // groups, *self.kernel_size)
+
+        # Initialize phase weights
+        phase = torch.empty(kernel_shape, device=device, dtype=dtype)
+        self.phase = nn.Parameter(torch.nn.init.uniform_(phase, -math.pi, math.pi))
 
         # Initialize modulus weights
-        fan_in = self.in_channels * np.prod(self.kernel_size)
+        fan_in = in_channels * np.prod(self.kernel_size)
         modulus = torch.empty(kernel_shape, device=device, dtype=dtype)
         bound = 1 / math.sqrt(fan_in)
         self.modulus = nn.Parameter(torch.nn.init.uniform_(modulus, -bound, bound))
 
-        # Initialize phase weights
-        phase = torch.empty(kernel_shape, device=device, dtype=dtype)
-        self.phase = nn.Parameter(torch.nn.init.uniform_(phase, -np.pi, np.pi))
-
         # Initialize bias
         if bias:
-            self.bias = nn.Parameter(torch.zeros(self.out_channels, device=device, dtype=dtype))
+            self.bias = nn.Parameter(torch.zeros(out_channels, device=device, dtype=dtype))
         else:
             self.register_parameter('bias', None)
 
-    @staticmethod
-    def _normalize_tuple(value, rank, name):
-        """
-        Normalize input to a tuple.
-        """
+    def _normalize_tuple(self, value, rank, name):
         if isinstance(value, int):
             return (value,) * rank
-        elif isinstance(value, tuple) and len(value) == rank:
-            return value
         else:
-            raise ValueError(f"Invalid {name}. Expected an int or a tuple of length {rank}.")
+            return tuple(value)
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        padding = self._get_padding(input.shape) if isinstance(self.padding, str) else self.padding
+        
+        # Calculate quaternion weights
+        cos_weights = torch.cos(self.phase)
+        sin_weights = torch.sin(self.phase)
+        
+        # Get convolution function based on rank
+        conv_fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self.rank]
+
+        # Perform convolution with real and imaginary parts
+        output_real = conv_fn(input, cos_weights * self.modulus, None, 
+                            self.strides, padding, self.dilation, self.groups)
+        output_imag = conv_fn(input, sin_weights * self.modulus, None,
+                            self.strides, padding, self.dilation, self.groups)
+
+        # Combine outputs
+        output = output_real - output_imag
+
+        # Add bias if present
+        if self.bias is not None:
+            output = output + self.bias.view(1, -1, *([1] * (len(output.shape) - 2)))
+            
+        return output
 
     def _get_padding(self, input_size):
         if isinstance(self.padding, str) and self.padding.lower() == 'same':
@@ -83,47 +107,42 @@ class QConv(nn.Module):
                 dilation = self.dilation[-(i + 1)]
                 
                 out_dim = (input_dim + stride - 1) // stride
-                pad_needed = max(0, (out_dim - 1) * stride + ((kernel_dim - 1) * dilation + 1) - input_dim)
+                pad_needed = max(0, (out_dim - 1) * stride + 
+                               ((kernel_dim - 1) * dilation + 1) - input_dim)
                 pad_start = pad_needed // 2
                 pad_end = pad_needed - pad_start
                 pad = [pad_start, pad_end] + pad
             return tuple(pad)
-        elif isinstance(self.padding, (int, tuple)):
-            if isinstance(self.padding, int):
-                return (self.padding,) * (2 * self.rank)
-            return self.padding
-        else:
-            raise ValueError(f"Unsupported padding type: {self.padding}")
+        return self.padding
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        # Compute the padding as needed
-        padding = self._get_padding(input.shape)
-        
-        if isinstance(padding, tuple) and len(padding) > 2:
-            input = F.pad(input, padding, mode=self.padding_mode, value=0)
-            padding = 0
+class QConv2d(QConv):
+    """2D Quaternion Convolution layer."""
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int, int]],
+                 stride: Union[int, Tuple[int, int]] = 1,
+                 padding: Union[str, int, Tuple[int, int]] = 0,
+                 dilation: Union[int, Tuple[int, int]] = 1,
+                 groups: int = 1,
+                 bias: bool = True,
+                 padding_mode: str = 'zeros',
+                 device=None,
+                 dtype=None) -> None:
+        super().__init__(
+            rank=2,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype)
 
-        # Generate quaternion weights
-        cos_weights = torch.cos(self.phase)
-        sin_weights = torch.sin(self.phase)
-        real_weight = cos_weights * self.modulus
-        imag_weight = sin_weights * self.modulus
-
-        # Choose convolution function based on rank
-        conv_fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self.rank]
-
-        # Perform quaternion convolution
-        output_real = conv_fn(input, real_weight, None, self.strides, padding, self.dilation, self.groups)
-        output_imag = conv_fn(input, imag_weight, None, self.strides, padding, self.dilation, self.groups)
-
-        # Combine real and imaginary outputs according to quaternion algebra
-        output = output_real - output_imag
-
-        # Add bias if it exists
-        if self.bias is not None:
-            output += self.bias.view(1, -1, *([1] * (output.dim() - 2)))
-
-        return output
 
 class QConv1d(QConv):
     """1D Quaternion Convolution layer."""
@@ -151,33 +170,33 @@ class QConv1d(QConv):
             device=device,
             dtype=dtype)
 
-class QConv2d(QConv):
-    """2D Quaternion Convolution layer."""
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 kernel_size: Union[int, Tuple[int, int]],
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[str, int, Tuple[int, int]] = 0,
-                 dilation: Union[int, Tuple[int, int]] = 1,
-                 groups: int = 1,
-                 bias: bool = True,
-                 padding_mode: str = 'zeros',
-                 device=None,
-                 dtype=None) -> None:
-        super(QConv2d, self).__init__(
-            rank=2,
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            strides=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-            padding_mode=padding_mode,
-            device=device,
-            dtype=dtype)
+# class QConv2d(QConv):
+#     """2D Quaternion Convolution layer."""
+#     def __init__(self,
+#                  in_channels: int,
+#                  out_channels: int,
+#                  kernel_size: Union[int, Tuple[int, int]],
+#                  stride: Union[int, Tuple[int, int]] = 1,
+#                  padding: Union[str, int, Tuple[int, int]] = 0,
+#                  dilation: Union[int, Tuple[int, int]] = 1,
+#                  groups: int = 1,
+#                  bias: bool = True,
+#                  padding_mode: str = 'zeros',
+#                  device=None,
+#                  dtype=None) -> None:
+#         super(QConv2d, self).__init__(
+#             rank=2,
+#             in_channels=in_channels,
+#             out_channels=out_channels,
+#             kernel_size=kernel_size,
+#             strides=stride,
+#             padding=padding,
+#             dilation=dilation,
+#             groups=groups,
+#             bias=bias,
+#             padding_mode=padding_mode,
+#             device=device,
+#             dtype=dtype)
 
 
 class QConv3d(QConv):

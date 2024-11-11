@@ -9,7 +9,7 @@ scales:
   x: [1.00, 1.50, 512]
 
 backbone:
-  - [-1, 1, QConv2d, [in_channels=3, out_channels=64, kernel_size=3, stride=2]]    # 0-P1/2
+  - [-1, 1, QConv2d, [in_channels=4, out_channels=64, kernel_size=3, stride=2]]    # 0-P1/2
   - [-1, 1, QConv2d, [in_channels=64, out_channels=128, kernel_size=3, stride=2]]  # 1-P2/4
   - [-1, 2, C3k2, [in_channels=128, out_channels=256, param=False, ratio=0.25]]  # 2
   - [-1, 1, QConv2d, [in_channels=256, out_channels=256, kernel_size=3, stride=2]] # 3-P3/8

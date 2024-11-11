@@ -111,7 +111,8 @@ class QuaternionCIFAR10(nn.Module):
     """
     def __init__(self):
         super(QuaternionCIFAR10, self).__init__()
-        
+    
+        # PREVIOUSLY WORKING CODE
         # First block
         self.block1 = nn.Sequential(
             QConv2d(in_channels=3, out_channels=32, kernel_size=3, padding='same'),

@@ -1,5 +1,3 @@
-# train.py
-
 #!/usr/bin/env python
 # train.py
 

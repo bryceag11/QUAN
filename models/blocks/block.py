@@ -367,77 +367,6 @@ class QC3(nn.Module):
         y = self.act3(y)
         return y
 
-
-class QBottleneck(nn.Module):
-    """
-    Quaternion Bottleneck block that preserves quaternion properties.
-    Ensures channel dimensions are multiples of 4.
-    """
-    def __init__(self, in_channels, out_channels, shortcut=True, groups=1, expansion=0.5):
-        super(QBottleneck, self).__init__()
-        hidden_channels = int(out_channels * expansion)
-        # Ensure hidden_channels is a multiple of 4
-        hidden_channels = (hidden_channels // 4) * 4
-
-        self.cv1 = QConv2d(
-            in_channels=in_channels,
-            out_channels=hidden_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=False
-        )
-        self.bn1 = QBN(hidden_channels)
-
-        self.act1 = QuaternionActivation(nn.SiLU())
-
-        self.cv2 = QConv2d(
-            in_channels=hidden_channels,
-            out_channels=hidden_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            groups=groups,
-            bias=False
-        )
-        self.bn2 = QBN(hidden_channels)
-        self.act2 = QuaternionActivation(nn.SiLU())
-
-        self.cv3 = QConv2d(
-            in_channels=hidden_channels,
-            out_channels=out_channels,
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=False
-        )
-        self.bn3 = QBN(out_channels)
-
-        self.shortcut = shortcut and (in_channels == out_channels)
-        if self.shortcut:
-            self.bn_skip = QBN(out_channels)
-
-    def forward(self, x):
-        identity = x
-
-        out = self.cv1(x)
-        out = self.bn1(out)
-        out = self.act1(out)
-
-        out = self.cv2(out)
-        out = self.bn2(out)
-        out = self.act2(out)
-
-        out = self.cv3(out)
-        out = self.bn3(out)
-
-        if self.shortcut:
-            identity = self.bn_skip(identity)
-            out += identity
-
-        out = QuaternionActivation(nn.SiLU())(out)
-        return out
-
 class QCSPBottleneck(nn.Module):
     """
     General Quaternion CSP Bottleneck.
@@ -645,67 +574,68 @@ class CBFuse(nn.Module):
         fused += xs[-1]
         return fused
 
-class C3k2(nn.Module):
-
-    def __init__(self, in_channels: int, out_channels: int, n: int = 1, e: float = 0.5, g: int = 1, shortcut: bool = True, **kwargs):
-        """
-        Initializes the C3k2 module with specified channels and configurations.
-
-        Args:
-            in_channels (int): Number of input channels.
-            out_channels (int): Number of output channels.
-            n (int): Number of repeats for the module.
-            e (float): Expansion rate or ratio.
-            g (int): Group convolution factor.
-            shortcut (bool): Whether to include a shortcut connection.
-            **kwargs: Additional arguments for flexibility, ignored if unused.
-        """
-        super(C3k2, self).__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4 for quaternions."
-        self.c = int(out_channels * e)
-        self.c = (self.c // 4) * 4  # Ensure multiple of 4
-
-        # Initial convolutions
-        self.cv1 = QConv2d(in_channels, self.c, kernel_size=1, stride=1, padding=0, bias=False)
-        self.cv2 = QConv2d(in_channels, self.c, kernel_size=1, stride=1, padding=0, bias=False)
-
-        # Sequential blocks: either C3k or QBottleneck based on kwargs
-        self.m = nn.Sequential(*[
-            QBottleneck(in_channels=self.c, out_channels=self.c, shortcut=shortcut, groups=g, expansion=1.0) for _ in range(n)
-        ])
-
-        # Final convolution
-        self.cv3 = QConv2d((2 + n) * self.c, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn3 = IQBN(out_channels)
-        self.act3 = QReLU()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the C3k2 module.
+class QBottleneck(nn.Module):
+    """
+    Quaternion Bottleneck block with proper quaternion handling.
+    """
+    def __init__(self, in_channels, out_channels, shortcut=True, groups=1, expansion=0.5):
+        super().__init__()
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4"
+        hidden_channels = int(out_channels * expansion)
+        hidden_channels = (hidden_channels // 4) * 4  # Ensure multiple of 4
         
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C1, 4, H, W).
-        
-        Returns:
-            torch.Tensor: Output tensor of shape (B, C2, 4, H, W).
-        """
-        # Initial convolutions
-        y = [self.cv2(x), self.cv1(x)]  # y[0] = cv2(x), y[1] = cv1(x)
-        
-        # Apply sequential blocks
-        for m in self.m:
-            y.append(m(y[-1]))
-        
-        # Concatenate all processed features
-        out = torch.cat(y, dim=1)  # Shape: (B, (2 + n) * c, 4, H, W)
-        
-        # Final convolution
+        self.cv1 = QConv2d(in_channels, hidden_channels, kernel_size=1, stride=1)
+        self.cv2 = QConv2d(hidden_channels, hidden_channels, kernel_size=3, stride=1, padding=1, groups=groups)
+        self.cv3 = QConv2d(hidden_channels, out_channels, kernel_size=1, stride=1)
+        self.shortcut = shortcut and (in_channels == out_channels)
+
+    def forward(self, x):
+        out = self.cv1(x)
+        out = self.cv2(out)
         out = self.cv3(out)
-        out = self.bn3(out)
-        out = self.act3(out)
-        
+        if self.shortcut:
+            out = out + x
         return out
+    
+class C3k2(nn.Module):
+    def __init__(self, in_channels, out_channels, n=1, e=0.5, g=1, shortcut=True):
+        super().__init__()
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4"
+        
+        # Calculate intermediate channels
+        c_ = int(out_channels * e)
+        c_ = (c_ // 4) * 4  # Ensure multiple of 4
+        
+        # Initial convolutions splitting input
+        self.cv1 = QConv2d(in_channels, c_, kernel_size=1, stride=1)
+        self.cv2 = QConv2d(in_channels, c_, kernel_size=1, stride=1)
+        
+        # Bottleneck blocks
+        self.m = nn.Sequential(*[
+            QBottleneck(
+                in_channels=c_,
+                out_channels=c_,
+                shortcut=shortcut,
+                groups=g,
+                expansion=1.0
+            ) for _ in range(n)
+        ])
+        
+        # Final projection
+        concat_channels = 3 * c_  # c_ from cv1, c_ from cv2, c_ from bottleneck
+        self.cv3 = QConv2d(concat_channels, out_channels, kernel_size=1, stride=1)
 
+    def forward(self, x):
+        # Process through parallel paths
+        y1 = self.cv1(x)  # First path
+        y2 = self.cv2(x)  # Second path
+        y3 = self.m(y1)   # Bottleneck path
+        
+        # Concatenate directly using torch.cat
+        y = torch.cat([y2, y1, y3], dim=1)
+        
+        # Final convolution
+        return self.cv3(y)
 
 class C3k(nn.Module):
     """
@@ -768,234 +698,85 @@ class C3k(nn.Module):
         
         return x
 
-class MaxSigmoidAttnBlock(nn.Module):
-    """
-    Quaternion Max Sigmoid Attention Block.
-    
-    This module applies a max-sigmoid attention mechanism to enhance feature representation by emphasizing important regions.
-    
-    Args:
-        c1 (int): Number of input channels (must be a multiple of 4).
-        c2 (int): Number of output channels (must be a multiple of 4).
-        nh (int): Number of heads.
-        ec (int): Embedding channels.
-        gc (int): Global channels.
-        scale (bool): Whether to apply scaling.
-    """
-    def __init__(self, c1: int, c2: int, nh: int =1, ec: int =128, gc: int =512, scale: bool =False):
-        super(MaxSigmoidAttnBlock, self).__init__()
-        assert c1 %4 ==0 and c2 %4 ==0, "Channels must be multiples of 4 for quaternions."
-        
-        self.nh = nh
-        self.hc = c2 // nh
-        assert self.hc %4 ==0, "h*c must be a multiple of 4 for quaternions."
-        
-        # Optional embedding convolution
-        self.ec = QConv2d(c1, ec, kernel_size=1, stride=1, padding=0, bias=False) if c1 != ec else None
-        self.bn_ec = IQBN(ec) if self.ec is not None else None
-        self.act_ec = QReLU() if self.ec is not None else None
-        
-        # Linear layer for global context
-        self.gl = nn.Linear(gc, ec)
-        
-        # Bias parameter
-        self.bias = nn.Parameter(torch.zeros(nh))
-        
-        # Projection convolution
-        self.proj_conv = QConv2d(c1, c2, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn_proj = IQBN(c2)
-        self.act_proj = QReLU()
-        
-        # Scaling parameter
-        self.scale = nn.Parameter(torch.ones(1, nh, 1, 1)) if scale else torch.tensor(1.0)
-    
-    def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass through the MaxSigmoidAttnBlock.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C1, 4, H, W).
-            guide (torch.Tensor): Guide tensor for attention mechanism, shape (B, gc).
-        
-        Returns:
-            torch.Tensor: Output tensor after applying attention and projection.
-        """
-        B, C, quat_dim, H, W = x.shape
-        assert quat_dim ==4, "Quaternion dimension must be 4."
-        
-        # Apply embedding convolution if defined
-        if self.ec is not None:
-            embed = self.ec(x)
-            embed = self.bn_ec(embed)
-            embed = self.act_ec(embed)
-        else:
-            embed = x  # Shape: (B, C1, 4, H, W)
-        
-        # Reshape embed for attention computation
-        embed = embed.view(B, self.nh, self.hc, H, W)  # Shape: (B, nh, hc, H, W)
-        
-        # Process guide tensor through linear layer
-        guide = self.gl(guide)  # Shape: (B, ec)
-        guide = guide.view(B, -1, 1, 1)  # Shape: (B, ec, 1, 1)
-        
-        # Compute attention scores using einsum for batch matrix multiplication
-        # Example: using dot product between embed and guide
-        attn_scores = torch.einsum('bnc,nc->bn', embed.view(B, self.nh, -1), guide.squeeze(-1))  # Shape: (B, nh)
-        
-        # Apply max over spatial dimensions (simplified)
-        attn = attn_scores.unsqueeze(-1).unsqueeze(-1)  # Shape: (B, nh, 1, 1)
-        attn = torch.sigmoid(attn + self.bias.view(1, -1, 1, 1))  # Shape: (B, nh, 1, 1)
-        
-        # Apply scaling
-        attn = attn * self.scale
-        
-        # Apply attention to embed
-        out = embed * attn.unsqueeze(2)  # Shape: (B, nh, hc, H, W)
-        out = out.view(B, -1, H, W)  # Shape: (B, c2, H, W)
-        
-        # Apply projection convolution
-        out = self.proj_conv(out)
-        out = self.bn_proj(out)
-        out = self.act_proj(out)
-        
-        return out
-
 class QAttention(nn.Module):
     """
     Quaternion Attention module performing self-attention on quaternion-structured input tensors.
-    
-    Args:
-        dim (int): Number of input channels (must be a multiple of 4).
-        num_heads (int): Number of attention heads (dim must be divisible by (num_heads * 4)).
-        attn_ratio (float): Ratio to determine key dimension relative to head dimension.
-        
-    Attributes:
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimension of each attention head.
-        key_dim (int): Dimension of the attention key.
-        scale (float): Scaling factor for attention scores.
-        qkv (QConv2d): Convolutional layer to compute queries, keys, and values.
-        proj (QConv2d): Convolutional layer to project the attended values.
-        pe (QConv2d): Depthwise convolutional layer for positional encoding.
+    Properly handles 5D input tensors (batch, channels, quaternion_dim, height, width).
     """
     def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 1.0):
         super(QAttention, self).__init__()
-        assert dim % (num_heads * 4) == 0, "dim must be divisible by (num_heads * 4)."
+        assert dim % num_heads == 0, "dim must be divisible by num_heads."
         
         self.num_heads = num_heads
-        # Each head's dimension should be a multiple of 4 to handle quaternion components
-        self.head_dim = (dim // num_heads) // 4 * 4  
+        self.head_dim = dim // num_heads  # Corrected: head_dim should NOT be divided by 4
         self.key_dim = int(self.head_dim * attn_ratio)
-        assert self.key_dim % 4 == 0, "key_dim must be a multiple of 4."
-        
         self.scale = self.key_dim ** -0.5
         
-        nh_kd = self.key_dim * self.num_heads
-        h = dim + nh_kd * 2  # Total output channels for qkv
+        # Total output channels for qkv (query, key, value)
+        nh_kd = self.num_heads * self.key_dim
+        h = nh_kd * 3  # For q, k, v
         
-        assert h % 4 == 0, "Total qkv channels (h) must be a multiple of 4."
+        # Quaternion-aware convolutions
+        self.qkv = QConv2d(dim, h, kernel_size=1, stride=1)
+        self.proj = QConv2d(dim, dim, kernel_size=1, stride=1)
+        self.pe = QConv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim)
         
-        # Quaternion-aware convolution to compute queries, keys, and values
-        self.qkv = QConv2d(dim, h, kernel_size=1, stride=1, padding=0, bias=False)
-        # Quaternion-aware convolution to project the attended values back to original dimension
-        self.proj = QConv2d(dim, dim, kernel_size=1, stride=1, padding=0, bias=False)
-        # Depthwise convolution for positional encoding
-        self.pe = QConv2d(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim, bias=False)
-        
+        # Initialize weights
+        for layer in [self.qkv, self.proj, self.pe]:
+            if isinstance(layer, QConv2d):
+                nn.init.normal_(layer.modulus, std=0.02)
+                nn.init.constant_(layer.phase, 0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of the Quaternion Attention module.
+        Forward pass through the Quaternion Attention module.
         
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W).
+            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W)
         
         Returns:
-            torch.Tensor: Output tensor after self-attention, shape (B, C, 4, H, W).
+            torch.Tensor: Output tensor after self-attention, shape (B, C, 4, H, W)
         """
-        B, C, quat_dim, H, W = x.shape
-        assert quat_dim == 4, "Quaternion dimension must be 4."
-        assert C % 4 == 0, "Number of channels must be a multiple of 4."
+        B, C, Q, H, W = x.shape
+        assert Q == 4, "Quaternion dimension must be 4."
+        assert C % self.num_heads == 0, "Channels must be divisible by num_heads."
         
-        # Reshape to (B, C, H, W)
-        x = x.view(B, C, H, W)
+        # Reshape to combine batch and quaternion dimensions
+        x_flat = x.permute(0, 2, 1, 3, 4).reshape(B * Q, C, H, W)  # [B*4, C, H, W]
         
-        # Compute queries, keys, and values
-        qkv = self.qkv(x)  # Shape: (B, h, H, W)
-        h_qkv = qkv.shape[1]
+        # Compute Q, K, V
+        qkv = self.qkv(x_flat)  # [B*4, 3*nh_kd, H, W]
+        qkv = qkv.chunk(3, dim=1)  # [B*4, nh_kd, H, W] each
+        q, k, v = qkv
+        
         # Reshape for multi-head attention
-        qkv = qkv.view(B, self.num_heads, -1, H * W)  # Shape: (B, num_heads, h_qkv//num_heads, N)
+        q = q.view(B, Q, self.num_heads, self.key_dim, H * W)  # [B, 4, num_heads, key_dim, H*W]
+        k = k.view(B, Q, self.num_heads, self.key_dim, H * W)  # [B, 4, num_heads, key_dim, H*W]
+        v = v.view(B, Q, self.num_heads, self.head_dim, H * W)  # [B, 4, num_heads, head_dim, H*W]
         
-        # Split into queries, keys, and values
-        split_size = [self.key_dim, self.key_dim, self.head_dim]
-        q, k, v = torch.split(qkv, split_size, dim=2)  # Each: (B, num_heads, key_dim or head_dim, N)
+        # Permute to bring num_heads to the front
+        q = q.permute(0, 2, 1, 3, 4)  # [B, num_heads, 4, key_dim, H*W]
+        k = k.permute(0, 2, 1, 3, 4)  # [B, num_heads, 4, key_dim, H*W]
+        v = v.permute(0, 2, 1, 3, 4)  # [B, num_heads, 4, head_dim, H*W]
         
         # Compute attention scores
-        attn = (q.transpose(-2, -1) @ k) * self.scale  # Shape: (B, num_heads, N, N)
-        attn = F.softmax(attn, dim=-1)  # Shape: (B, num_heads, N, N)
+        attn_scores = (q @ k.transpose(-2, -1)) * self.scale  # [B, num_heads, 4, key_dim, key_dim]
+        attn = torch.softmax(attn_scores, dim=-1)  # [B, num_heads, 4, key_dim, key_dim]
         
-        # Compute attended values
-        out = (v @ attn.transpose(-2, -1))  # Shape: (B, num_heads, head_dim, N)
-        out = out.view(B, C, H, W)  # Shape: (B, C, H, W)
+        # Apply attention to V
+        out = attn @ v  # [B, num_heads, 4, key_dim, H*W]
         
-        # Add positional encoding
-        out = out + self.pe(v.view(B, C, H, W))
+        # Reshape and permute back
+        out = out.permute(0, 2, 1, 3, 4).reshape(B * Q, self.num_heads * self.key_dim, H, W)  # [B*4, C, H, W]
         
-        # Project the output
-        out = self.proj(out)  # Shape: (B, C, H, W)
+        # Apply positional embedding and projection
+        out = self.proj(out) + self.pe(x_flat)  # [B*4, C, H, W]
         
         # Reshape back to quaternion structure
-        out = out.view(B, C, 4, H, W)
+        out = out.view(B, Q, C, H, W).permute(0, 2, 1, 3, 4)  # [B, C, 4, H, W]
         
         return out
 
-class PSABlock(nn.Module):
-    """
-    PSABlock class implementing a Position-Sensitive Attention block for quaternion neural networks.
-    
-    Combines Quaternion Attention with a quaternion-specific feed-forward network and optional residual connections.
-    
-    Args:
-        c (int): Number of input and output channels (must be a multiple of 4).
-        attn_ratio (float): Ratio to determine key dimension in attention.
-        num_heads (int): Number of attention heads.
-        shortcut (bool): Whether to include residual connections.
-    """
-    def __init__(self, c: int, attn_ratio: float = 1.0, num_heads: int = 8, shortcut: bool = True):
-        super(PSABlock, self).__init__()
-        assert c % 4 == 0, "Number of channels must be a multiple of 4."
-        assert c % (num_heads * 4) == 0, "Number of channels must be divisible by (num_heads * 4)."
-        
-        self.attn = QAttention(dim=c, num_heads=num_heads, attn_ratio=attn_ratio)
-        
-        # Feed-Forward Network: Conv -> Activation -> Conv
-        self.ffn = nn.Sequential(
-            QConv2d(c, c * 2, kernel_size=1, stride=1, padding=0, bias=False),
-            IQBN(c * 2),
-            QReLU(),
-            QConv2d(c * 2, c, kernel_size=1, stride=1, padding=0, bias=False),
-            IQBN(c)
-        )
-        
-        self.shortcut = shortcut
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the PSABlock.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W).
-        
-        Returns:
-            torch.Tensor: Output tensor after applying attention and feed-forward network.
-        """
-        residual = x
-        out = self.attn(x)
-        if self.shortcut:
-            out = out + residual
-        out = self.ffn(out)
-        if self.shortcut:
-            out = out + residual
-        return out
 
 class PSA(nn.Module):
     """
@@ -1073,26 +854,14 @@ class PSA(nn.Module):
         
         return out
 
-
 class C2PSA(nn.Module):
-    """
-    C2PSA module with attention mechanism for enhanced feature extraction in quaternion neural networks.
-    
-    Args:
-        in_channels (int): Number of input channels (must be a multiple of 4).
-        out_channels (int): Number of output channels (must be a multiple of 4).
-        n (int): Number of PSABlock instances.
-        e (float): Expansion ratio for hidden channels.
-        g (int): Number of groups for grouped convolutions.
-        shortcut (bool): Whether to include residual connections.
-    """
+    """C2PSA module with proper quaternion handling."""
     def __init__(self, in_channels: int, out_channels: int, n: int = 1, e: float = 0.5, g: int = 1, shortcut: bool = True):
-        super(C2PSA, self).__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4."
+        super().__init__()
+        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4"
 
         self.hidden_channels = int(out_channels * e)
         self.hidden_channels = (self.hidden_channels // 4) * 4  # Ensure multiple of 4
-        assert self.hidden_channels > 0, "Hidden channels must be a positive multiple of 4."
 
         # Initial quaternion convolution for channel reduction
         self.cv1 = QConv2d(in_channels, 2 * self.hidden_channels, kernel_size=1, stride=1, padding=0, bias=False)
@@ -1100,46 +869,222 @@ class C2PSA(nn.Module):
         self.act1 = QReLU()
 
         # Stack of PSABlock instances
-        self.m = nn.Sequential(*[PSABlock(c=self.hidden_channels, attn_ratio=1.0, num_heads=self.hidden_channels // 16, shortcut=shortcut) for _ in range(n)])
+        self.m = nn.Sequential(*[
+            PSABlock(
+                c=self.hidden_channels, 
+                attn_ratio=1.0, 
+                num_heads=max(1, self.hidden_channels // 16), 
+                shortcut=shortcut
+            ) for _ in range(n)
+        ])
 
-        # Quaternion attention block (ensure gc, ec, nh are defined or pass as init arguments)
-        self.attn = MaxSigmoidAttnBlock(self.hidden_channels, self.hidden_channels)
+        # Attention block
+        self.attn = MaxSigmoidAttnBlock(
+            c1=self.hidden_channels,
+            c2=self.hidden_channels,
+            nh=max(1, self.hidden_channels // 32),
+            ec=max(32, self.hidden_channels // 4),
+            gc=max(64, self.hidden_channels // 2)
+        )
 
-        # Final quaternion convolution to restore channels
+        # Linear layer to transform pooled features into guide tensor
+        self.gl = nn.Linear(self.hidden_channels, self.attn.gc)
+
+        # Final quaternion convolution
         self.cv2 = QConv2d((2 + n) * self.hidden_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn2 = IQBN(out_channels)
         self.act2 = QReLU()
 
-    def forward(self, x: torch.Tensor, guide: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Store out_channels for reshaping
+        self.out_channels = out_channels
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the C2PSA module.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W)
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W)
+        """
+        B, C, Q, H, W = x.shape
+        assert Q == 4, "Quaternion dimension must be 4."
+
+        # 1. Reshape input from [B, C, 4, H, W] to [B*4, C, H, W]
+        x_reshaped = x.view(B * Q, C, H, W)
+
+        # 2. Apply initial convolution
+        y = self.cv1(x_reshaped)  # [B*4, 2*hidden_channels, H, W]
+
+        # 3. Reshape back to [B, 2*hidden_channels, 4, H, W]
+        y = y.view(B, 2 * self.hidden_channels, Q, H, W)
+
+        # 4. Apply BatchNorm and Activation
+        y = self.bn1(y)          # [B, 2*hidden_channels, 4, H, W]
+        y = self.act1(y)         # [B, 2*hidden_channels, 4, H, W]
+
+        # 5. Split into two branches
+        y1, y2 = y.chunk(2, dim=1)  # Each: [B, hidden_channels, 4, H, W]
+
+        # 6. Pass through PSABlock instances
+        y_psa = self.m(y2)  # [B, hidden_channels, 4, H, W]
+
+        # 7. Generate the guide tensor using global average pooling on y2
+        guide = y2.mean(dim=[3, 4])  # [B, hidden_channels]
+        guide = self.gl(guide)        # [B, gc]
+
+        # 8. Apply attention to y_psa with the guide tensor
+        y_attn = self.attn(y_psa, guide)  # [B, hidden_channels, H, W]
+
+        # 9. Reshape y_attn to include the quaternion dimension
+        y_attn = y_attn.unsqueeze(2)  # [B, hidden_channels, 1, H, W]
+        y_attn = y_attn.repeat(1, 1, Q, 1, 1)  # [B, hidden_channels, 4, H, W]
+
+        # 10. Concatenate features along the channel dimension
+        y = torch.cat([y1, y_psa, y_attn], dim=1)  # [B, (2 + n)*hidden_channels, 4, H, W]
+
+        # 11. Reshape y to [B*4, (2 + n)*hidden_channels, H, W] for final convolution
+        y = y.view(B * Q, (2 + len(self.m)) * self.hidden_channels, H, W)
+
+        # 12. Apply final convolution, batch norm, and activation
+        y = self.cv2(y)            # [B*4, out_channels, H, W]
+        y = self.bn2(y)            # [B*4, out_channels, H, W]
+        y = self.act2(y)           # [B*4, out_channels, H, W]
+
+        # 13. Reshape back to [B, out_channels, 4, H, W]
+        y = y.view(B, self.out_channels, Q, H, W)
+
+        return y
+
+class PSABlock(nn.Module):
+    """Position Sensitive Attention Block for quaternion features."""
+    def __init__(self, c: int, attn_ratio: float = 1.0, num_heads: int = 8, shortcut: bool = True):
+        super().__init__()
+        assert c % 4 == 0, "Number of channels must be a multiple of 4"
+        assert c % (num_heads * 4) == 0, "Channels must be divisible by (num_heads * 4)"
+        
+        self.attn = QAttention(dim=c, num_heads=num_heads, attn_ratio=attn_ratio)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            QConv2d(c, c * 2, kernel_size=1, stride=1, padding=0, bias=False),
+            IQBN(c * 2),
+            QReLU(),
+            QConv2d(c * 2, c, kernel_size=1, stride=1, padding=0, bias=False),
+            IQBN(c)
+        )
+        
+        self.shortcut = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+        
+        # Apply attention
+        out = self.attn(x)
+        if self.shortcut:
+            out = out + identity
+            
+        # Apply feed-forward network
+        out = self.ffn(out)
+        if self.shortcut:
+            out = out + identity
+            
+        return out
+
+
+class MaxSigmoidAttnBlock(nn.Module):
+    """
+    Quaternion Max Sigmoid Attention Block.
+    
+    This module applies a max-sigmoid attention mechanism to enhance feature representation by emphasizing important regions.
+    
+    Args:
+        c1 (int): Number of input channels (must be a multiple of 4).
+        c2 (int): Number of output channels (must be a multiple of 4).
+        nh (int): Number of heads.
+        ec (int): Embedding channels.
+        gc (int): Global channels.
+        scale (bool): Whether to apply scaling.
+    """
+    def __init__(self, c1: int, c2: int, nh: int =1, ec: int =128, gc: int =512, scale: bool =False):
+        super(MaxSigmoidAttnBlock, self).__init__()
+        assert c1 %4 ==0 and c2 %4 ==0, "Channels must be multiples of 4 for quaternions."
+        
+        self.nh = nh
+        self.hc = c2 // nh
+        assert self.hc %4 ==0, "h*c must be a multiple of 4 for quaternions."
+        
+        # Optional embedding convolution
+        self.ec_conv = QConv2d(c1, ec, kernel_size=1, stride=1, padding=0, bias=False) if c1 != ec else None
+        self.bn_ec = IQBN(ec) if self.ec_conv is not None else None
+        self.act_ec = QReLU() if self.ec_conv is not None else None
+        
+        # Linear layer for global context
+        self.gl = nn.Linear(gc, ec)
+        
+        # Bias parameter
+        self.bias = nn.Parameter(torch.zeros(nh))
+        
+        # Projection convolution
+        self.proj_conv = QConv2d(c1, c2, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn_proj = IQBN(c2)
+        self.act_proj = QReLU()
+        
+        # Scaling parameter
+        self.scale = nn.Parameter(torch.ones(1, nh, 1, 1)) if scale else torch.tensor(1.0)
+        
+        # Store gc as an attribute for external access
+        self.gc = gc
+
+    def forward(self, x: torch.Tensor, guide: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass through the MaxSigmoidAttnBlock.
         
         Args:
-            x (torch.Tensor): Input tensor of shape (B, in_channels, 4, H, W).
-            guide (Optional[torch.Tensor]): Optional guide tensor for attention.
+            x (torch.Tensor): Input tensor of shape (B, C1, 4, H, W).
+            guide (torch.Tensor): Guide tensor for attention mechanism, shape (B, gc).
         
         Returns:
-            torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W).
+            torch.Tensor: Output tensor after applying attention and projection.
         """
-        # Initial conv-bn-activation
-        y = self.act1(self.bn1(self.cv1(x)))
-
-        # Split into two branches
-        y_a, y_b = y.chunk(2, dim=1)
-
-        # Pass through PSABlock instances
-        psablock_out = self.m(y_b)
-
-        # Apply attention
-        attn_out = self.attn(psablock_out, guide) if guide is not None else self.attn(psablock_out)
-
-        # Concatenate features
-        y = torch.cat([y_a, psablock_out, attn_out], dim=1)
-
-        # Final conv-bn-activation
-        y = self.act2(self.bn2(self.cv2(y)))
+        B, C, quat_dim, H, W = x.shape
+        assert quat_dim ==4, "Quaternion dimension must be 4."
         
-        return y
+        # Apply embedding convolution if defined
+        if self.ec_conv is not None:
+            embed = self.ec_conv(x)            # [B, ec, 4, H, W]
+            embed = self.bn_ec(embed)          # [B, ec, 4, H, W]
+            embed = self.act_ec(embed)         # [B, ec, 4, H, W]
+        else:
+            embed = x                           # [B, C1, 4, H, W]
+        
+        # Reshape embed for attention computation
+        embed = embed.view(B, self.nh, self.hc, H, W)  # [B, nh, hc, H, W]
+        
+        # Process guide tensor through linear layer
+        guide = self.gl(guide)        # [B, ec]
+        
+        # Compute attention scores using einsum for batch matrix multiplication
+        # Example: using dot product between embed and guide
+        attn_scores = torch.einsum('bnc,nc->bn', embed.view(B, self.nh, -1), guide)  # [B, nh]
+        
+        # Apply sigmoid activation with bias
+        attn = torch.sigmoid(attn_scores.unsqueeze(-1).unsqueeze(-1) + self.bias.view(1, -1, 1, 1))  # [B, nh, 1, 1]
+        
+        # Apply scaling
+        attn = attn * self.scale
+        
+        # Apply attention to embed
+        out = embed * attn.unsqueeze(2)  # [B, nh, hc, H, W]
+        out = out.view(B, -1, H, W)     # [B, c2, H, W]
+        
+        # Apply projection convolution
+        out = self.proj_conv(out)        # [B, c2, H, W]
+        out = self.bn_proj(out)          # [B, c2, H, W]
+        out = self.act_proj(out)         # [B, c2, H, W]
+        
+        return out
 
 
 

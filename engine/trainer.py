@@ -50,14 +50,27 @@ class Trainer:
         
         for batch_idx, batch in progress_bar:
             images = batch['image'].to(self.device)         # Shape: (B, 4, H, W)
+            print(f"Input shape: {images.shape}")  # Should be (B, 4, H, W)
             target_bboxes = batch['bbox'].to(self.device)   # Shape: (B, 4)
             target_categories = batch['category'].to(self.device)  # Shape: (B,)
             target_quats = batch['quat'].to(self.device)    # Shape: (B, 4)
             anchor_points = batch.get('anchor_points', None)  # Shape: (B, 2) or other, depending on implementation
 
             # Forward pass
-            preds = self.model(images)  # Adjust based on your model's forward method
-
+            try:
+                preds = self.model(images)
+                print(f"Output shape: {preds.shape}")
+            except Exception as e:
+                print(f"Error in forward pass: {str(e)}")
+                print(f"Layer shapes:")
+                x = images
+                for name, module in self.model.named_children():
+                    try:
+                        x = module(x)
+                        print(f"{name}: {x.shape}")
+                    except Exception as inner_e:
+                        print(f"Error in {name}: {str(inner_e)}")
+                        raise inner_e  # Raise the actual error instead of 'e'
             # Compute loss
             loss, losses = self.loss_fn(preds, target_bboxes, target_categories, target_quats, anchor_points)
 
@@ -72,6 +85,10 @@ class Trainer:
 
             # Log to CSV
             self._log_to_csv(epoch+1, batch_idx+1, losses)
+
+            # Periodically visualize predictions with NMS (every 100 batches)
+            if batch_idx % 100 == 0:
+                self._visualize_batch(images, preds, target_bboxes, target_quats, batch_idx, epoch)
 
     def _log_to_csv(self, epoch, batch, losses):
         """
@@ -109,3 +126,46 @@ class Trainer:
         checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pth')
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved at {checkpoint_path}")
+
+    def _visualize_batch(self, images, preds, target_bboxes, target_quats, batch_idx, epoch):
+        """Visualize a batch of predictions with NMS."""
+        from utils.visualization import quaternion_nms, plot_obb_on_image
+        
+        self.model.eval()
+        with torch.no_grad():
+            # Get predictions (assuming preds contains boxes, scores, and quats)
+            if isinstance(preds, dict):
+                pred_boxes = preds['boxes']
+                pred_scores = preds['scores']
+                pred_quats = preds['quats']
+            else:
+                # Adjust based on your model's output format
+                pred_boxes, pred_scores, pred_quats = preds[:3]
+
+            # Apply NMS and visualize first image in batch
+            if pred_scores[0].numel() > 0:  # If there are any predictions
+                keep = quaternion_nms(
+                    pred_boxes[0],
+                    pred_scores[0],
+                    pred_quats[0],
+                    iou_threshold=0.5
+                )
+                
+                # Save visualization
+                save_path = os.path.join(
+                    self.save_dir,
+                    'visualizations',
+                    f'epoch_{epoch}_batch_{batch_idx}.png'
+                )
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                
+                # Plot predictions and ground truth
+                plot_obb_on_image(
+                    images[0],  # First image in batch
+                    torch.cat([pred_boxes[0][keep], pred_quats[0][keep]], dim=1),  # Filtered predictions
+                    target_bboxes[0],  # Ground truth
+                    target_quats[0],
+                    save_path
+                )
+
+        self.model.train()
