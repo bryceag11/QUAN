@@ -9,33 +9,32 @@ scales:
   x: [1.00, 1.50, 512]
 
 backbone:
-  - [-1, 1, QConv2d, [in_channels=4, out_channels=64, kernel_size=3, stride=2]]    # 0-P1/2
-  - [-1, 1, QConv2d, [in_channels=64, out_channels=128, kernel_size=3, stride=2]]  # 1-P2/4
-  - [-1, 2, C3k2, [in_channels=128, out_channels=256, param=False, ratio=0.25]]  # 2
-  - [-1, 1, QConv2d, [in_channels=256, out_channels=256, kernel_size=3, stride=2]] # 3-P3/8
-  - [-1, 2, C3k2, [in_channels=256, out_channels=512, param=False, ratio=0.25]]  # 4
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=512, kernel_size=3, stride=2]] # 5-P4/16
-  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=True]]               # 6
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=1024, kernel_size=3, stride=2]]# 7-P5/32
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=1024, param=True]]             # 8
-  - [-1, 1, SPPF, [in_channels=1024, out_channels=1024, kernel_size=5]]                            # 9
-  - [-1, 2, C2PSA, [in_channels=1024, out_channels=1024]]                                          # 10
-
+  - [-1, 1, QConv2d, {'in_channels': 4, 'out_channels': 32, 'kernel_size': 3, 'stride': 2}]     # 0: P1/2
+  - [0, 1, QConv2d, {'in_channels': 32, 'out_channels': 64, 'kernel_size': 3, 'stride': 2}]    # 1: P2/4
+  - [1, 1, C3k2, {'in_channels': 64, 'out_channels': 128, 'c3k': False, 'e': 0.25}]           # 2
+  - [2, 1, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': False, 'e': 0.25}]          # 3
+  - [3, 1, QConv2d, {'in_channels': 128, 'out_channels': 128, 'kernel_size': 3, 'stride': 2}]  # 4: P3/8
+  - [4, 1, C3k2, {'in_channels': 128, 'out_channels': 256, 'c3k': False, 'e': 0.25}]          # 5
+  - [5, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False, 'e': 0.25}]          # 6
+  - [6, 1, QConv2d, {'in_channels': 256, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}]  # 7: P4/16
+  - [7, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': True, 'e': 0.25}]                       # 8
+  - [8, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': True, 'e': 0.25}]                       # 9
+  - [9, 1, QConv2d, {'in_channels': 256, 'out_channels': 512, 'kernel_size': 3, 'stride': 2}]  # 10: P5/32
+  - [10, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True,'e': 0.25}]                      # 11
+  - [11, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True,'e': 0.25}]                      # 12
+  - [12, 1, SPPF, {'in_channels': 512, 'out_channels': 512, 'kernel_size': 5}]                 # 13
+  
 head:
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                                 # Upsample P5 to P4
-  - [[-1, 6], 1, QuaternionConcat, [1]]                                         # Concatenate with P4
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=False]]           # 13
-    
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                                 # Upsample P4 to P3
-  - [[-1, 4], 1, QuaternionConcat, [1]]                                         # Concatenate with P3
-  - [-1, 2, C3k2, [in_channels=512, out_channels=256, param=False]]            # 16 (P3/8-small)
-    
-  - [-1, 1, QConv2d, [in_channels=256, out_channels=256, kernel_size=3, stride=2]] # Upsample P3 to P2
-  - [[-1, 13], 1, QuaternionConcat, [1]]                                        # Concatenate with P4
-  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=False]]            # 19 (P4/16-medium)
-    
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=512, kernel_size=3, stride=2]] # Upsample P4 to P1
-  - [[-1, 10], 1, QuaternionConcat, [1]]                                        # Concatenate with P5
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=True]]            # 22 (P5/32-large)
-    
-  - [[16, 19, 22], 1, QDetectHead, {'nc': 80, 'ch': [256, 512, 1024]}]  # Detect(P3, P4, P5)
+  - [13, 1, nn.Upsample, {'scale_factor': 2, 'mode': 'nearest'}]                               # 14
+  - [[14, 4], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 512}]       # 15
+  - [15, 1, C3k2, {'in_channels': 512, 'out_channels': 256, 'c3k': False}]                   # 16
+  - [16, 1, nn.Upsample, {'scale_factor': 2, 'mode': 'nearest'}]                               # 17
+  - [[17, 9], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 256}]       # 18
+  - [18, 1, C3k2, {'in_channels': 256, 'out_channels': 128, 'c3k': False}]                   # 19
+  - [19, 1, QConv2d, {'in_channels': 128, 'out_channels': 128, 'kernel_size': 3, 'stride': 2}] # 20
+  - [[20, 15], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 256}]      # 21
+  - [21, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False}]                   # 22
+  - [22, 1, QConv2d, {'in_channels': 256, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}] # 23
+  - [[23, 14], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 512}]      # 24
+  - [24, 1, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True}]                    # 25
+  - [[19, 22, 25], 1, QDetectHead, {'nc': 80, 'ch': [128, 256, 512]}]                       # Detection Head

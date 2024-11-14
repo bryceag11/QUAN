@@ -1,117 +1,188 @@
-#!/usr/bin/env python
 # train.py
+import gc
+import os
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32"
 import torch
 import yaml
 import argparse
 from data.dataloader import get_quaternion_dataloader
 from models.model_builder import load_model_from_yaml
-from loss.box_loss import RotatedBboxLoss
+from loss.box_loss import DetectionLoss, BboxLoss  # Import DetectionLoss instead of BboxLoss and RotatedBBoxLoss
 from engine.trainer import Trainer
-from engine.validator import Validator
-from utils.metrics import OBBMetrics
+from utils.metrics import OBBMetrics, DetMetrics
 from torch.optim import Adam
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torchvision import transforms
-import os
+import torch.backends.cudnn as cudnn
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train Quaternion-based YOLO Model")
-    parser.add_argument('--config', type=str, default='configs/models/q.yaml', help='Path to the YAML config file')
-    parser.add_argument('--data', type=str, required=True, help='Path to dataset configuration file')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=16, help='Training batch size')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--save-dir', type=str, default='runs/train', help='Directory to save checkpoints and logs')
-    parser.add_argument('--profile', action='store_true', help='Profile model FLOPs and parameters')
+    parser = argparse.ArgumentParser(description="Train Quaternion-based Object Detection Model")
+    parser.add_argument('--config', type=str, default='configs/models/q.yaml', help='Path to model config')
+    parser.add_argument('--data', type=str, required=True, help='Path to data config')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
+    parser.add_argument('--batch-size', type=int, default=16, help='Batch size')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Initial learning rate')
+    parser.add_argument('--save-dir', type=str, default='runs/train', help='Save directory')
+    parser.add_argument('--resume', type=str, default='', help='Resume from checkpoint')
     return parser.parse_args()
 
 def main():
+    
+    # Parse arguments
     args = parse_args()
+    
 
+    torch.cuda.empty_cache()  # Clear cache at start of epoch
+
+    # Set device and CUDA settings
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    cudnn.benchmark = True
+    
+    # Create save directory
+    os.makedirs(args.save_dir, exist_ok=True)
+    
     # Load dataset configuration
     with open(args.data, 'r') as f:
-        dataset_config = yaml.safe_load(f)
+        data_config = yaml.safe_load(f)
     
-    active_dataset = dataset_config['active_dataset']
-    train_dataset_info = dataset_config['datasets'][active_dataset]['train']
-    val_dataset_info = dataset_config['datasets'][active_dataset]['val']
-
-    # Load model from YAML configuration
-    model, nc = load_model_from_yaml(args.config)
-
-    # Move model to device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
-
-    # Profile model if requested
-    if args.profile:
-        from utils.profile import get_model_complexity
-        complexity = get_model_complexity(model, input_size=(4, 640, 640))  # Adjust input size as needed
-        print(complexity)
-        return  # Exit after profiling
-
-    # Define transforms and augmentations
+    # Get dataset info
+    active_dataset = data_config['active_dataset']
+    train_info = data_config['datasets'][active_dataset]['train']
+    val_info = data_config['datasets'][active_dataset]['val']
+    
+    # Define transforms
     transform = transforms.Compose([
         transforms.Resize((640, 640)),
         transforms.ToTensor(),
-        # Add normalization if needed
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-    augmentations = None  # Replace with your QuaternionAugmentations if applicable
 
-    # Initialize dataloaders
+    # Create dataloaders
     train_dataloader = get_quaternion_dataloader(
-        img_dir=train_dataset_info['img_dir'],
-        ann_file=train_dataset_info['ann_file'],
+        img_dir=train_info['img_dir'],
+        ann_file=train_info['ann_file'],
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
-        dataset_type=active_dataset.lower(),  # 'dota' or 'coco'
+        num_workers=0,
+        dataset_type=active_dataset.lower(),
         transform=transform,
-        augmentations=augmentations
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2
     )
+    
     val_dataloader = get_quaternion_dataloader(
-        img_dir=val_dataset_info['img_dir'],
-        ann_file=val_dataset_info['ann_file'],
+        img_dir=val_info['img_dir'],
+        ann_file=val_info['ann_file'],
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
-        dataset_type=active_dataset.lower(),  # 'dota' or 'coco'
+        num_workers=0,
+        dataset_type=active_dataset.lower(),
         transform=transform,
-        augmentations=None  # Typically, no augmentations during validation
+        pin_memory=True,
+        persistent_workers=False,
+        prefetch_factor=2
     )
-
-    # Initialize loss function
-    loss_fn = RotatedBboxLoss(reg_max=16)  # Adjust reg_max as needed
-
+    
+    # Initialize model
+    model, nc = load_model_from_yaml(args.config)
+    model = model.to(device)
+    
+    # Check if model has parameters
+    if not any(p.requires_grad for p in model.parameters()):
+        raise ValueError("The loaded model has no trainable parameters. Please check the model configuration.")
+    print(f"Model loaded successfully with {sum(p.numel() for p in model.parameters() if p.requires_grad)} trainable parameters.")
+    
     # Initialize optimizer and scheduler
-    optimizer = Adam(model.parameters(), lr=args.lr)
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=1e-2,
+        amsgrad=False  # Disable AMS-Grad to save memory
+    )
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
     # Initialize metrics
-    class_names = {0: 'class1', 1: 'class2'}  # Update with actual class names
-    metric = OBBMetrics(save_dir=args.save_dir, plot=True, names=class_names)
+    metrics = DetMetrics(
+        save_dir=args.save_dir,
+        plot=True,
+        names={i: f'class_{i}' for i in range(nc)}  # Or your actual class names
+    )
+    
+    # Choose appropriate loss function based on dataset type
+    if active_dataset.lower() == 'dota':
+        loss_fn = DetectionLoss(reg_max=16, nc=nc, use_quat=True, tal_topk=10)  # For oriented bounding boxes
+    else:
+        loss_fn = BboxLoss(reg_max=16, nc=80, use_quat=False)  # For axis-aligned bounding boxes
+    
+    # Move loss function to device if necessary
+    loss_fn = loss_fn.to(device)
+    
+    # Resume from checkpoint if specified
+    start_epoch = 0
+    if args.resume:
+        if os.path.isfile(args.resume):
+            checkpoint = torch.load(args.resume, map_location=device)
+            start_epoch = checkpoint['epoch'] + 1
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            print(f'Resumed from epoch {start_epoch}')
+        else:
+            print(f"No checkpoint found at '{args.resume}'. Starting from scratch.")
+    
 
-    # Initialize trainer and validator
-    trainer = Trainer(model, train_dataloader, optimizer, scheduler, loss_fn, device=device, save_dir=args.save_dir)
-    validator = Validator(model, val_dataloader, metric, device=device, save_dir=os.path.join(args.save_dir, 'validate'))
-
-    # Create directory for validation results
-    os.makedirs(os.path.join(args.save_dir, 'validate'), exist_ok=True)
-
-    # Start training
-    for epoch in range(args.epochs):
+        # Initialize mixed precision scaler
+    scaler = torch.amp.GradScaler(
+        init_scale=2**16,
+        growth_factor=2.0,
+        backoff_factor=0.5,
+        growth_interval=2000
+    )
+    # Initialize trainer
+    trainer = Trainer(
+        model=model,
+        train_dataloader=train_dataloader,
+        val_dataloader=val_dataloader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=scaler,
+        loss_fn=loss_fn,
+        metrics=metrics,
+        device=device,
+        save_dir=args.save_dir,
+        grad_clip_val=1.0,
+        visualize=True,
+        vis_batch_freq=100
+    )
+    
+    # Training loop
+    print("Starting training...")
+    for epoch in range(start_epoch, args.epochs):
         print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
-        trainer.train_one_epoch(epoch)
-        print(f"Epoch {epoch+1} training completed. Starting validation.")
-        validator.validate()
-        print(f"Epoch {epoch+1} validation completed.")
+        
+        # Clear cache before each epoch
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        # Train and validate
+        train_metrics = trainer.train_one_epoch(epoch)
+        
+        if epoch % 5 == 0 or epoch == args.epochs - 1:
+            torch.cuda.empty_cache()
+            val_metrics = trainer.validate()
+            print("\nValidation Results:")
+            for k, v in val_metrics.items():
+                print(f"{k}: {v:.4f}")
+        
+        # Save checkpoint
         trainer.save_checkpoint(epoch)
-
-    # Final Visualization (if any)
-    metric.plot_final_metrics(save_dir=args.save_dir, names=class_names)
-
-    print("Training and validation completed. Metrics and visualizations saved.")
+        
+        # Update and plot metrics
+        if 'val_metrics' in locals():
+            metrics.update(epoch=epoch, train_metrics=train_metrics, val_metrics=val_metrics)
+            metrics.plot()
 
 if __name__ == "__main__":
     main()

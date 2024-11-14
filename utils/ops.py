@@ -5,91 +5,101 @@ from itertools import product
 import seaborn
 import numpy as np 
 import shapely.geometry
+import math
 
-
-def dist2bbox(anchor_points, pred_dist, xywh=True):
+def bbox2dist(anchor_points, target_bboxes, reg_max):
     """
-    Convert distance predictions to bounding box coordinates.
-
+    Convert bounding boxes to distances for DFL.
+    
     Args:
-        anchor_points (torch.Tensor): Anchor points, shape (N, 2).
-        pred_dist (torch.Tensor): Predicted distances, shape (N, 4 * reg_max).
-        xywh (bool): If True, return [x, y, w, h], else [x1, y1, x2, y2].
-
+        anchor_points: [num_anchors, 2]
+        target_bboxes: [num_anchors, 4]
+        reg_max: int
+    
     Returns:
-        torch.Tensor: Bounding boxes, shape (N, 4).
+        distances: [num_anchors, 4]
     """
-    reg_max = pred_dist.shape[1] // 4
-    pred_dist = pred_dist.view(-1, 4, reg_max).softmax(dim=2).matmul(torch.arange(reg_max, device=pred_dist.device).float().unsqueeze(0))
-    pred_dist = pred_dist * (reg_max - 1)
+    x1, y1, x2, y2 = target_bboxes[:, 0], target_bboxes[:, 1], target_bboxes[:, 2], target_bboxes[:, 3]
+    xa, ya = anchor_points[:, 0], anchor_points[:, 1]
+    
+    # Calculate distances
+    d_l = xa - x1
+    d_t = ya - y1
+    d_r = x2 - xa
+    d_b = y2 - ya
+    
+    # Clamp distances to [0, reg_max]
+    d_l = torch.clamp(d_l, min=0, max=reg_max)
+    d_t = torch.clamp(d_t, min=0, max=reg_max)
+    d_r = torch.clamp(d_r, min=0, max=reg_max)
+    d_b = torch.clamp(d_b, min=0, max=reg_max)
+    
+    distances = torch.stack([d_l, d_t, d_r, d_b], dim=1)
+    return distances
 
+
+def dist2bbox(distances, anchor_points, xywh=True):
+    """
+    Convert distances to bounding boxes with clamping to ensure numerical stability.
+    
+    Args:
+        distances: [batch_size, num_anchors, 4]
+        anchor_points: [num_anchors, 2]
+        xywh: bool, whether to return (x, y, w, h) or (x1, y1, x2, y2)
+    
+    Returns:
+        bboxes: [batch_size, num_anchors, 4]
+    """
     if xywh:
-        x = anchor_points[:, 0] - pred_dist[:, 0]
-        y = anchor_points[:, 1] - pred_dist[:, 1]
-        w = pred_dist[:, 2] + pred_dist[:, 0]
-        h = pred_dist[:, 3] + pred_dist[:, 1]
-        return torch.stack([x, y, w, h], dim=1)
+        x = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 0])
+        y = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 1])
+        w = distances[:, :, 0] + distances[:, :, 2]
+        h = distances[:, :, 1] + distances[:, :, 3]
+        
+        # Clamp width and height to prevent negative or extreme values
+        w = torch.clamp(w, min=1.0, max=1e4)
+        h = torch.clamp(h, min=1.0, max=1e4)
+        
+        bboxes = torch.stack([x, y, w, h], dim=2)
     else:
-        x1 = anchor_points[:, 0] - pred_dist[:, 0]
-        y1 = anchor_points[:, 1] - pred_dist[:, 1]
-        x2 = anchor_points[:, 0] + pred_dist[:, 2]
-        y2 = anchor_points[:, 1] + pred_dist[:, 3]
-        return torch.stack([x1, y1, x2, y2], dim=1)
+        x1 = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 0]) - distances[:, :, 0]
+        y1 = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 1]) - distances[:, :, 1]
+        x2 = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 2]) + distances[:, :, 2]
+        y2 = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 3]) + distances[:, :, 3]
+        
+        # Clamp coordinates to prevent negative or extreme values
+        x1 = torch.clamp(x1, min=0.0, max=1e4)
+        y1 = torch.clamp(y1, min=0.0, max=1e4)
+        x2 = torch.clamp(x2, min=0.0, max=1e4)
+        y2 = torch.clamp(y2, min=0.0, max=1e4)
+        
+        bboxes = torch.stack([x1, y1, x2, y2], dim=2)
+    return bboxes
 
-def dist2rbox(anchor_points, pred_dist, reg_max=16):
-    """
-    Convert distance predictions to rotated bounding box coordinates with quaternions.
 
+def make_anchors(feats, strides, grid_cell_offset=0.5):
+    """Generate anchors from features.
+    
     Args:
-        anchor_points (torch.Tensor): Anchor points, shape (N, 2).
-        pred_dist (torch.Tensor): Predicted distances, shape (N, 4 * reg_max).
-        reg_max (int): Maximum value for distribution focal loss.
-
+        feats (list[torch.Tensor]): List of feature maps
+        strides (torch.Tensor): Strides for each feature map
+        grid_cell_offset (float): Offset for grid cells
+        
     Returns:
-        torch.Tensor: Rotated bounding boxes, shape (N, 8) [x, y, w, h, qx, qy, qz, qw].
+        tuple: anchor_points, stride_tensor
     """
-    reg_max = pred_dist.shape[1] // 4
-    pred_dist = pred_dist.view(-1, 4, reg_max).softmax(dim=2).matmul(torch.arange(reg_max, device=pred_dist.device).float().unsqueeze(0))
-    pred_dist = pred_dist * (reg_max - 1)
+    anchor_points, stride_tensor = [], []
+    
+    for i, stride in enumerate(strides):
+        _, _, h, w = feats[i].shape
+        sx = torch.arange(w, device=feats[i].device, dtype=torch.float32) + grid_cell_offset  # shift x
+        sy = torch.arange(h, device=feats[i].device, dtype=torch.float32) + grid_cell_offset  # shift y
+        sy, sx = torch.meshgrid(sy, sx, indexing='ij')
+        anchor_points.append(torch.stack((sx, sy), -1).view(-1, 2) * stride)
+        stride_tensor.append(torch.full((h * w,), stride, device=feats[i].device))
+    
+    return torch.cat(anchor_points), torch.cat(stride_tensor)
 
-    x = anchor_points[:, 0] - pred_dist[:, 0]
-    y = anchor_points[:, 1] - pred_dist[:, 1]
-    w = pred_dist[:, 2] + pred_dist[:, 0]
-    h = pred_dist[:, 3] + pred_dist[:, 1]
-
-    # Placeholder for quaternion. Replace with actual quaternion predictions.
-    # Assuming you have separate quaternion predictions.
-    quat = torch.zeros((pred_dist.shape[0], 4), device=pred_dist.device)
-    quat[:, 3] = 1.0  # Initialize with no rotation
-
-    return torch.cat([x.unsqueeze(1), y.unsqueeze(1), w.unsqueeze(1), h.unsqueeze(1), quat], dim=1)
-
-
-def make_anchors(feats, strides, offset=0.5):
-    """
-    Generate anchor points for each feature map.
-
-    Args:
-        feats (list): List of feature map tensors.
-        strides (list): List of strides for each feature map.
-        offset (float): Offset to center the anchors.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: Anchor points and stride tensor.
-    """
-    anchor_points = []
-    stride_tensor = []
-    for i, feat in enumerate(feats):
-        h, w = feat.shape[-2:]
-        stride = strides[i]
-        grid_y, grid_x = torch.meshgrid(torch.arange(h, device=feat.device), torch.arange(w, device=feat.device))
-        grid = torch.stack([grid_x, grid_y], dim=-1).view(-1, 2).float()
-        grid = grid * stride + stride * offset
-        anchor_points.append(grid)
-        stride_tensor.append(torch.full((grid.shape[0],), stride, device=feat.device))
-    anchor_points = torch.cat(anchor_points, dim=0)
-    stride_tensor = torch.cat(stride_tensor, dim=0)
-    return anchor_points, stride_tensor
 
 def xywh2xyxy(boxes):
     """
@@ -157,16 +167,23 @@ def bbox2dist(anchor_points, bboxes, reg_max=16, xywh=True):
     Returns:
         torch.Tensor: Distance distributions, shape (N, 4 * reg_max).
     """
+
+    if bboxes.numel() == 0:
+        print("Warning: Empty bboxes tensor!")
+        return
+
     if xywh:
-        # Convert [x, y, w, h] to [x1, y1, x2, y2]
-        x_center, y_center, width, height = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
+        # Ensure bboxes has correct shape
+        if bboxes.dim() != 2 or bboxes.shape[1] != 4:
+            raise ValueError(f"Expected bboxes shape (N, 4), got {bboxes.shape}")
+            
+        x_center, y_center, width, height = bboxes.unbind(1)
         x1 = x_center - width / 2
         y1 = y_center - height / 2
         x2 = x_center + width / 2
         y2 = y_center + height / 2
     else:
-        # Assume bboxes are already in [x1, y1, x2, y2] format
-        x1, y1, x2, y2 = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
+        x1, y1, x2, y2 = bboxes.unbind(1)
 
     # Extract anchor coordinates
     anchor_x, anchor_y = anchor_points[:, 0], anchor_points[:, 1]
@@ -260,3 +277,89 @@ def polygon_to_obb(polygon):
 
     return [x, y, w, h, qx, qy, qz, qw]
 
+
+def dist2rbox(anchor_points, pred_dist, xywh=True, dim=-1):
+    """
+    Convert distance predictions to rotated bounding boxes.
+
+    Args:
+        anchor_points (torch.Tensor): Anchor points, shape (N, 2) or (batch, N, 2)
+        pred_dist (torch.Tensor): Distance predictions, shape (N, 4) or (batch, N, 4)
+        xywh (bool): If True, return boxes in xywh format, else return in xyxy format
+        dim (int): Dimension along which to split predictions
+
+    Returns:
+        torch.Tensor: Rotated bounding boxes in chosen format
+    """
+    # Ensure inputs have compatible shapes
+    if pred_dist.dim() == 3 and anchor_points.dim() == 2:
+        anchor_points = anchor_points.unsqueeze(0).expand(pred_dist.size(0), -1, -1)
+    
+    # Split predictions
+    if pred_dist.size(dim) == 4:  # Standard distance predictions
+        distance = pred_dist
+    else:  # Predictions include angle
+        distance, angle = torch.split(pred_dist, [4, 1], dim=dim)
+    
+    # Convert distances to box parameters
+    if xywh:
+        # Center coordinates
+        c_x = anchor_points[..., 0] + distance[..., 0]
+        c_y = anchor_points[..., 1] + distance[..., 1]
+        # Width and height
+        w = distance[..., 2].exp()
+        h = distance[..., 3].exp()
+        
+        if distance.size(dim) > 4:  # If we have angle predictions
+            # Add rotation parameters
+            cos_a = torch.cos(angle[..., 0])
+            sin_a = torch.sin(angle[..., 0])
+            
+            # Create rotated box coordinates
+            x1 = c_x - w/2 * cos_a + h/2 * sin_a
+            y1 = c_y - w/2 * sin_a - h/2 * cos_a
+            x2 = c_x + w/2 * cos_a + h/2 * sin_a
+            y2 = c_y + w/2 * sin_a - h/2 * cos_a
+            
+            return torch.stack((c_x, c_y, w, h, angle[..., 0]), dim=dim)
+        else:
+            return torch.stack((c_x, c_y, w, h), dim=dim)
+    else:
+        # Convert to xyxy format
+        x1 = anchor_points[..., 0] + distance[..., 0]
+        y1 = anchor_points[..., 1] + distance[..., 1]
+        x2 = anchor_points[..., 0] + distance[..., 2]
+        y2 = anchor_points[..., 1] + distance[..., 3]
+        
+        if distance.size(dim) > 4:  # If we have angle predictions
+            return torch.stack((x1, y1, x2, y2, angle[..., 0]), dim=dim)
+        else:
+            return torch.stack((x1, y1, x2, y2), dim=dim)
+
+def rbox2dist(anchor_points, rbox, reg_max):
+    """
+    Convert rotated bounding boxes to distance predictions.
+
+    Args:
+        anchor_points (torch.Tensor): Anchor points (N, 2)
+        rbox (torch.Tensor): Rotated bounding boxes (N, 5) in [x, y, w, h, angle] format
+        reg_max (int): Maximum value for distance bins
+
+    Returns:
+        torch.Tensor: Distance predictions and angle
+    """
+    # Extract box parameters
+    x, y, w, h, angle = rbox.unbind(-1)
+    
+    # Calculate distances
+    dist_x = x - anchor_points[..., 0]
+    dist_y = y - anchor_points[..., 1]
+    dist_w = w.log()
+    dist_h = h.log()
+    
+    # Clip distances to reg_max
+    dist = torch.stack((dist_x, dist_y, dist_w, dist_h), -1).clamp(-reg_max, reg_max)
+    
+    # Include angle
+    angle = angle.unsqueeze(-1)
+    return torch.cat([dist, angle], dim=-1)

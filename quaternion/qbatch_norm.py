@@ -5,205 +5,125 @@ import torch.nn.functional as F
 
 __all__ = ['QBN', 'VQBN', 'IQBN']
 
-class QBN(nn.Module):
-    def __init__(self, num_features, eps=1e-5):
-        """
-        Whitening Quaternion Batch Normalization Layer.
 
-        Args:
-            num_features (int): Number of quaternion features.
-            eps (float): A value added to the denominator for numerical stability.
-        """
-        super(QBN, self).__init__()
+# Whitening Quaternion Batch Normalization
+class QBN(nn.Module):
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
         self.num_features = num_features
         self.eps = eps
-
-        # Initialize Gamma and Beta as learnable parameters (each is a quaternion)
-        self.gamma = nn.Parameter(torch.ones(num_features, 4))
-        self.beta = nn.Parameter(torch.zeros(num_features, 4))
-
+        self.momentum = momentum
+        
+        # Learnable parameters
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        
+        # Running stats
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+    
     def forward(self, x):
         """
-        Forward pass for Quaternion Batch Normalization.
-
         Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, num_features, 4, ...).
-
-        Returns:
-            torch.Tensor: Normalized and affine-transformed tensor with the same shape as input.
+            x (torch.Tensor): Input tensor [B*Q, C, H, W]
+                             where B is batch size, Q is quaternion dimension (4)
         """
-        # Assume x has shape (batch_size, num_features, 4, ...)
-        # We'll treat additional dimensions as part of the batch for normalization
-        batch_size, num_features, num_quat, *rest = x.shape
-        assert num_quat == 4, "The quaternion dimension must be 4."
+        if self.training:
+            # Compute mean and var across batch*quaternion and spatial dimensions
+            mean = x.mean(dim=(0, 2, 3))  # [C]
+            var = x.var(dim=(0, 2, 3), unbiased=False)  # [C]
+            
+            # Update running stats
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
+        else:
+            mean = self.running_mean
+            var = self.running_var
+        
+        # Normalize
+        x_norm = (x - mean[None, :, None, None]) / (var[None, :, None, None] + self.eps).sqrt()
+        return self.gamma[None, :, None, None] * x_norm + self.beta[None, :, None, None]
 
-        # Reshape to (batch_size, num_features, 4, N) where N is the product of other dimensions
-        N = 1
-        for dim in rest:
-            N *= dim
-        x = x.view(batch_size, num_features, 4, N)
-
-        # Compute mean E(x) over the batch and spatial dimensions
-        E = x.mean(dim=0).mean(dim=-1)  # Shape: (num_features, 4)
-
-        # Center the input
-        x_centered = x - E.unsqueeze(-1)  # Shape: (num_features, 4, N)
-
-        # Compute covariance matrix V(x) for each feature
-        # V(x) has shape (num_features, 4, 4)
-        V = torch.zeros(self.num_features, 4, 4, device=x.device, dtype=x.dtype)
-        for f in range(self.num_features):
-            # x_centered[f] has shape (4, N)
-            # Compute covariance: (x_centered @ x_centered.T) / N
-            V[f] = (x_centered[f] @ x_centered[f].transpose(0, 1)) / N
-            # Add epsilon to the diagonal for numerical stability
-            V[f].diag().add_(self.eps)
-
-        # Invert the covariance matrix
-        V_inv = torch.inverse(V)  # Shape: (num_features, 4, 4)
-
-        # Perform Cholesky decomposition on V_inv to get W
-        # W is lower triangular such that W @ W.T = V_inv
-        try:
-            W = torch.linalg.cholesky(V_inv)  # Shape: (num_features, 4, 4)
-        except RuntimeError:
-            # If V_inv is not positive definite, add epsilon to the diagonal and retry
-            V_inv += torch.eye(4, device=x.device).unsqueeze(0) * self.eps
-            W = torch.linalg.cholesky(V_inv)
-
-        # Apply whitening: ~x = W @ (x - E)
-        # x_centered has shape (num_features, 4, N)
-        # W has shape (num_features, 4, 4)
-        x_whitened = torch.matmul(W, x_centered)  # Shape: (num_features, 4, N)
-
-        # Reshape back to original shape
-        x_whitened = x_whitened.view(batch_size, num_features, 4, *rest)
-
-        # Apply affine transformation: Gamma * ~x + Beta
-        # Gamma and Beta have shape (num_features, 4)
-        # Need to reshape Gamma and Beta for broadcasting
-        gamma = self.gamma.view(1, self.num_features, 4, *([1] * len(rest)))
-        beta = self.beta.view(1, self.num_features, 4, *([1] * len(rest)))
-        out = gamma * x_whitened + beta
-
-        return out
-
+# Variance Quaternion Batch Normalization
 class VQBN(nn.Module):
-    """
-    Variance Quaternion Batch Normalization (VQBN).
-    
-    Normalizes all components of each quaternion jointly using a shared variance.
-    """
-    def __init__(self, num_features: int, eps: float=1e-5, momentum: float=0.1):
-        """
-        Initializes the Variance Quaternion Batch Normalization layer.
-        
-        Args:
-            num_features (int): Number of quaternion features (channels must be multiples of 4).
-            eps (float): A value added to the denominator for numerical stability.
-            momentum (float): The value used for the running_mean and running_var computation.
-        """
-        super(VQBN, self).__init__()
-        assert num_features %4 ==0, "Number of features must be a multiple of 4 for quaternions."
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
-
-        # Learnable parameters gamma (scale) and beta (shift) for each quaternion
-        # Shape: [1, C, 4, 1, 1] for broadcasting
-        self.gamma = nn.Parameter(torch.ones(1, num_features, 4, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, num_features, 4, 1, 1))
-
-        # Running statistics
-        self.register_buffer('running_mean', torch.zeros(1, num_features, 4, 1, 1))
-        self.register_buffer('running_var', torch.ones(1, num_features, 4, 1, 1))
+        
+        # Learnable parameters
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        
+        # Running stats
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        Forward pass for Variance Quaternion Batch Normalization.
-        
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W).
-        
-        Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
+            x (torch.Tensor): Input tensor [B*Q, C, H, W]
+                             where B is batch size, Q is quaternion dimension (4)
         """
         if self.training:
-            # Compute mean and variance across batch and spatial dimensions for each quaternion
-            mean = x.mean(dim=(0, 3, 4), keepdim=True)  # Shape: [1, C, 4, 1, 1]
-            var = x.var(dim=(0, 3, 4), unbiased=False, keepdim=True)  # Shape: [1, C, 4, 1, 1]
+            # Compute stats
+            mean = x.mean(dim=(0, 2, 3))  # [C]
+            # Shared variance across quaternion components
+            var = x.var(dim=(0, 2, 3), unbiased=False)  # [C]
             
-            # Update running statistics
+            # Update running stats
             self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
             self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
         else:
-            # Use running statistics for inference
             mean = self.running_mean
             var = self.running_var
-        
-        # Normalize
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
-        
-        # Apply scale and shift
-        out = self.gamma * x_norm + self.beta
-        return out
+            
+        # Normalize with shared variance
+        x_norm = (x - mean[None, :, None, None]) / (var[None, :, None, None] + self.eps).sqrt()
+        return self.gamma[None, :, None, None] * x_norm + self.beta[None, :, None, None]
+
 class IQBN(nn.Module):
-    """
-    Independent Quaternion Batch Normalization (IQBN).
-
-    Normalizes each quaternion component independently to have zero mean and unit variance.
-    """
-    def __init__(self, num_features: int, eps: float=1e-5, momentum: float=0.1):
-        """
-        Initializes the Independent Quaternion Batch Normalization layer.
-        
-        Args:
-            num_features (int): Number of quaternion features (channels must be multiples of 4).
-            eps (float): A value added to the denominator for numerical stability.
-            momentum (float): The value used for the running_mean and running_var computation.
-        """
-        super(IQBN, self).__init__()
-        assert num_features %4 ==0, "Number of features must be a multiple of 4 for quaternions."
+    """Independent Quaternion Batch Normalization."""
+    def __init__(self, num_features, eps=1e-5, momentum=0.1):
+        super().__init__()
         self.num_features = num_features
         self.eps = eps
         self.momentum = momentum
-
-        # Learnable parameters gamma (scale) and beta (shift) for each quaternion component
-        # Shape: [1, C, 4, 1, 1] for broadcasting
-        self.gamma = nn.Parameter(torch.ones(1, num_features, 4, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, num_features, 4, 1, 1))
-
-        # Running statistics
-        self.register_buffer('running_mean', torch.zeros(1, num_features, 4, 1, 1))
-        self.register_buffer('running_var', torch.ones(1, num_features, 4, 1, 1))
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
+        # Learnable parameters
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        
+        # Running stats
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        
+    def forward(self, x):
         """
-        Forward pass for Independent Quaternion Batch Normalization.
+        Forward pass for IQBN.
         
         Args:
-            x (torch.Tensor): Input tensor of shape (B, C, 4, H, W).
+            x (torch.Tensor): Input tensor of shape [B*Q, C, H, W]
+                             where B is batch size, Q is quaternion dimension
         
         Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
+            torch.Tensor: Normalized tensor of the same shape
         """
         if self.training:
-            # Compute mean and variance across batch and spatial dimensions for each quaternion component
-            mean = x.mean(dim=(0, 3, 4), keepdim=True)  # Shape: [1, C, 4, 1, 1]
-            var = x.var(dim=(0, 3, 4), unbiased=False, keepdim=True)  # Shape: [1, C, 4, 1, 1]
+            # Compute stats over batch*quaternion and spatial dimensions
+            mean = x.mean(dim=(0, 2, 3))  # [C]
+            var = x.var(dim=(0, 2, 3), unbiased=False)  # [C]
             
-            # Update running statistics
+            # Update running stats
             self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
             self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
         else:
-            # Use running statistics for inference
             mean = self.running_mean
             var = self.running_var
         
         # Normalize
-        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        x_norm = (x - mean[None, :, None, None]) / torch.sqrt(var[None, :, None, None] + self.eps)
         
-        # Apply scale and shift
-        out = self.gamma * x_norm + self.beta
-        return out
-
+        # Apply affine transform
+        return self.gamma[None, :, None, None] * x_norm + self.beta[None, :, None, None]

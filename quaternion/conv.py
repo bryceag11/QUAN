@@ -73,29 +73,66 @@ class QConv(nn.Module):
             return tuple(value)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
+        """Memory-efficient forward pass."""
+        if input is None:
+            raise ValueError("Input tensor cannot be None")
+            
         padding = self._get_padding(input.shape) if isinstance(self.padding, str) else self.padding
-        
-        # Calculate quaternion weights
-        cos_weights = torch.cos(self.phase)
-        sin_weights = torch.sin(self.phase)
         
         # Get convolution function based on rank
         conv_fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self.rank]
 
-        # Perform convolution with real and imaginary parts
-        output_real = conv_fn(input, cos_weights * self.modulus, None, 
-                            self.strides, padding, self.dilation, self.groups)
-        output_imag = conv_fn(input, sin_weights * self.modulus, None,
-                            self.strides, padding, self.dilation, self.groups)
-
-        # Combine outputs
-        output = output_real - output_imag
-
+        # Calculate weights in chunks to save memory
+        chunk_size = min(32, self.out_channels)  # Adjust based on available memory
+        out_chunks = []
+        
+        for i in range(0, self.out_channels, chunk_size):
+            end_idx = min(i + chunk_size, self.out_channels)
+            chunk_slice = slice(i, end_idx)
+            
+            # Calculate quaternion weights for this chunk
+            cos_weights = torch.cos(self.phase[chunk_slice]) * self.modulus[chunk_slice]
+            sin_weights = torch.sin(self.phase[chunk_slice]) * self.modulus[chunk_slice]
+            
+            # Calculate output for this chunk
+            # Real part
+            chunk_real = conv_fn(
+                input=input,
+                weight=cos_weights,
+                bias=None,
+                stride=self.strides,
+                padding=padding,
+                dilation=self.dilation,
+                groups=self.groups
+            )
+            
+            # Imaginary part
+            chunk_imag = conv_fn(
+                input=input,
+                weight=sin_weights,
+                bias=None,
+                stride=self.strides,
+                padding=padding,
+                dilation=self.dilation,
+                groups=self.groups
+            )
+            
+            # Combine results for this chunk
+            out_chunk = chunk_real - chunk_imag
+            out_chunks.append(out_chunk)
+            
+            # Clear intermediates
+            del chunk_real, chunk_imag, cos_weights, sin_weights
+        
+        # Concatenate all chunks along channel dimension
+        output = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
+        
         # Add bias if present
         if self.bias is not None:
-            output = output + self.bias.view(1, -1, *([1] * (len(output.shape) - 2)))
-            
+            output = output + self.bias.view(1, -1, *([1] * (output.dim() - 2)))
+        
         return output
+        
 
     def _get_padding(self, input_size):
         if isinstance(self.padding, str) and self.padding.lower() == 'same':

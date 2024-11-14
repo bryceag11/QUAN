@@ -1,653 +1,453 @@
 import torch
 import torch.nn as nn
-from quaternion.conv import QConv2d
-from quaternion.init import QInit
-from models.blocks.block import C3k2, SPPF, C2PSA
-from models.neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN
-from models.heads.qdet_head import QDetectHead, QOBBHead
-import math
+from loss.box_loss import BboxLoss, DetectionLoss
+from utils.ops import xywh2xyxy, xyxy2xywh, dist2bbox, bbox2dist, make_anchors
+from utils.metrics import bbox_iou
+import numpy as np
+import torch.nn.functional as F
 
-def test_layer(layer, input_tensor, layer_name=""):
-    """Test a single layer with detailed debugging information."""
-    print(f"\n=== Testing {layer_name} ===")
-    print(f"Input shape: {input_tensor.shape}")
+def create_dummy_data(batch_size=2, h=20, w=20, num_classes=80, device='cuda'):
+    """Create dummy data for testing loss functions."""
+    # Calculate channels
+    reg_max = 16
+    num_anchors = h * w
+    
+    # Create standard predictions
+    pred_dist = torch.randn(batch_size, num_anchors, 4 * reg_max, device=device)
+    pred_scores = torch.randn(batch_size, num_anchors, num_classes, device=device)
+    
+    # Create quaternion predictions
+    pred_quat = torch.randn(batch_size, num_anchors, 4, device=device)
+    pred_quat = F.normalize(pred_quat, p=2, dim=-1)  # Normalize quaternions
+    
+    # Combine predictions
+    predictions = {
+        'pred_dist': pred_dist,
+        'pred_scores': pred_scores,
+        'pred_quat': pred_quat
+    }
+    
+    # Create target boxes and classes
+    target_boxes = torch.tensor([
+        [[0.2, 0.2, 0.4, 0.4],    # First image, first box
+         [0.6, 0.6, 0.8, 0.8]],   # First image, second box
+        [[0.3, 0.3, 0.5, 0.5],    # Second image, first box
+         [0.7, 0.7, 0.9, 0.9]]    # Second image, second box
+    ], device=device)
+    
+    target_cls = torch.tensor([
+        [0, 1],  # First image classes
+        [2, 3]   # Second image classes
+    ], device=device)
+    
+    # Create target quaternions
+    target_quats = torch.randn(batch_size, 2, 4, device=device)  # 2 boxes per image
+    target_quats = F.normalize(target_quats, p=2, dim=-1)
+    
+    # Combine targets
+    targets = {
+        'boxes': target_boxes,
+        'classes': target_cls,
+        'quats': target_quats
+    }
+    
+    return predictions, targets
+
+def test_bbox_conversions():
+    """Test bbox format conversions."""
+    print("\n=== Testing bbox format conversions ===")
+    
+    boxes_xywh = torch.tensor([[100, 100, 50, 30],  
+                              [200, 200, 40, 60]], dtype=torch.float32)
+    print("Original boxes (xywh):", boxes_xywh)
+    
+    boxes_xyxy = xywh2xyxy(boxes_xywh)
+    print("Converted to xyxy:", boxes_xyxy)
+    
+    boxes_xywh_back = xyxy2xywh(boxes_xyxy)
+    print("Converted back to xywh:", boxes_xywh_back)
+    
+    conversion_error = torch.abs(boxes_xywh - boxes_xywh_back).sum()
+    print(f"Conversion error: {conversion_error:.6f}")
+
+def test_bbox_iou():
+    """Test IoU calculations."""
+    print("\n=== Testing bbox IoU calculations ===")
+    
+    box1 = torch.tensor([[100, 100, 200, 200]], dtype=torch.float32)
+    box2 = torch.tensor([[150, 150, 250, 250]], dtype=torch.float32)
+    
+    iou = bbox_iou(box1, box2, xywh=False)
+    print("Overlapping boxes IoU:", iou)
+    
+    box3 = torch.tensor([[300, 300, 400, 400]], dtype=torch.float32)
+    iou_no_overlap = bbox_iou(box1, box3, xywh=False)
+    print("Non-overlapping boxes IoU:", iou_no_overlap)
+
+def test_bbox_loss():
+    """Test BboxLoss with detailed output."""
+    print("\n=== Testing BboxLoss ===")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Initialize loss functions
+    bbox_loss_standard = BboxLoss(reg_max=16, nc=80, use_quat=False).to(device)
+    bbox_loss_quat = BboxLoss(reg_max=16, nc=80, use_quat=True).to(device)
+    print("Initialized BboxLoss modules")
+    
+    # Create dummy data with consistent shapes
+    batch_size = 2
+    h = w = 20
+    num_anchors = h * w
+    reg_max = 16
+    
+    # Create predictions
+    pred_dist = torch.randn(batch_size, num_anchors, 4 * reg_max, device=device)
+    pred_dist_reshaped = pred_dist.view(batch_size, num_anchors, 4, reg_max).softmax(3)
+    pred_dist_decoded = (pred_dist_reshaped * torch.arange(reg_max, device=device)).sum(3)
+    
+    # Create anchor points
+    anchor_points = torch.rand(num_anchors, 2, device=device)
+    
+    # Create target scores and masks
+    target_scores = torch.rand(batch_size, num_anchors, device=device)
+    fg_mask = torch.rand(batch_size, num_anchors) > 0.5
+    fg_mask = fg_mask.to(device)
+    
+    # Ensure at least one positive sample
+    fg_mask[0, 0] = True
+    
+    # Create target boxes (2 boxes per image)
+    target_boxes = torch.rand(batch_size, num_anchors, 4, device=device)
     
     try:
-        # Print layer information
-        if isinstance(layer, QConv2d):
-            print(f"Layer info:")
-            print(f"  in_channels: {layer.in_channels}")
-            print(f"  out_channels: {layer.out_channels}")
-            print(f"  kernel_size: {layer.kernel_size}")
-            print(f"  Weight shapes:")
-            print(f"    modulus: {layer.modulus.shape}")
-            print(f"    phase: {layer.phase.shape}")
+        print("\nShape information:")
+        print(f"pred_dist shape: {pred_dist.shape}")
+        print(f"pred_dist_decoded shape: {pred_dist_decoded.shape}")
+        print(f"anchor_points shape: {anchor_points.shape}")
+        print(f"fg_mask shape: {fg_mask.shape}")
+        print(f"fg_mask sum: {fg_mask.sum()}")
         
-        # Forward pass
-        output = layer(input_tensor)
-        print(f"Output shape: {output.shape}")
-        print(f"Output stats:")
-        print(f"  mean: {output.mean().item():.4f}")
-        print(f"  std: {output.std().item():.4f}")
-        print(f"  min: {output.min().item():.4f}")
-        print(f"  max: {output.max().item():.4f}")
-        print("Test PASSED ✓")
-        return output
-    
+        print("\nTesting standard BboxLoss...")
+        # Decode boxes with proper shapes
+        pred_bboxes = dist2bbox(pred_dist_decoded, anchor_points)
+        print(f"pred_bboxes shape: {pred_bboxes.shape}")
+        
+        loss_components = bbox_loss_standard(
+            pred_dist,
+            pred_bboxes,
+            anchor_points,
+            target_boxes,
+            target_scores,
+            target_scores.sum(),
+            fg_mask
+        )
+        
+        print("Standard BboxLoss components:")
+        print(f"Box loss: {loss_components[0]:.4f}")
+        print(f"DFL loss: {loss_components[1]:.4f}")
+        
+        print("\nTesting quaternion BboxLoss...")
+        pred_quat = torch.randn(batch_size, num_anchors, 4, device=device)
+        pred_quat = F.normalize(pred_quat, p=2, dim=-1)
+        target_quats = torch.randn(batch_size, num_anchors, 4, device=device)
+        target_quats = F.normalize(target_quats, p=2, dim=-1)
+        
+        loss_components_quat = bbox_loss_quat(
+            pred_dist,
+            pred_bboxes,
+            anchor_points,
+            target_boxes,
+            target_scores,
+            target_scores.sum(),
+            fg_mask,
+            pred_quat,
+            target_quats
+        )
+        
+        print("Quaternion BboxLoss components:")
+        print(f"Box loss: {loss_components_quat[0]:.4f}")
+        print(f"DFL loss: {loss_components_quat[1]:.4f}")
+        print(f"Quaternion loss: {loss_components_quat[2]:.4f}")
+        
     except Exception as e:
-        print(f"Test FAILED ✗")
-        print(f"Error: {str(e)}")
-        raise e
-
-def test_backbone_components():
-    """Test each component that would be in the backbone."""
-    print("\n=== Testing Backbone Components ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Create input tensor
-    batch_size = 2
-    input_size = 640
-    x = torch.randn(batch_size, 4, input_size, input_size).to(device)
-    print(f"Initial input shape: {x.shape}")
-
-    # Test the model components one by one
-    test_cases = [
-        {
-            'name': 'Initial Conv',
-            'layer': QConv2d(4, 64, kernel_size=3, stride=2, padding=1),
-            'expected_shape': (batch_size, 64, input_size//2, input_size//2)
-        },
-        {
-            'name': 'Second Conv',
-            'layer': QConv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            'expected_shape': (batch_size, 128, input_size//4, input_size//4)
-        }
-    ]
-
-    for test_case in test_cases:
-        try:
-            layer = test_case['layer'].to(device)
-            name = test_case['name']
-            expected_shape = test_case['expected_shape']
-            
-            print(f"\nTesting {name}")
-            print("Input shape:", x.shape)
-            print("Layer info:")
-            print(f"  in_channels: {layer.in_channels}")
-            print(f"  out_channels: {layer.out_channels}")
-            print(f"  kernel_size: {layer.kernel_size}")
-            print(f"  Weight shapes:")
-            print(f"    modulus: {layer.modulus.shape}")
-            print(f"    phase: {layer.phase.shape}")
-            
-            # Forward pass
-            x = layer(x)
-            
-            print("Output shape:", x.shape)
-            print("Expected shape:", expected_shape)
-            assert x.shape == expected_shape, f"Shape mismatch: got {x.shape}, expected {expected_shape}"
-            print("✓ Shape test passed")
-            
-            # Test output statistics
-            print("Output statistics:")
-            print(f"  mean: {x.mean().item():.4f}")
-            print(f"  std: {x.std().item():.4f}")
-            print(f"  min: {x.min().item():.4f}")
-            print(f"  max: {x.max().item():.4f}")
-            
-        except Exception as e:
-            print(f"✗ Test failed for {name}")
-            print(f"Error: {str(e)}")
-            raise e
-
-def test_neck_components():
-    """Test neck components including upsampling and concatenation."""
-    print("\n=== Testing Neck Components ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-
-    # Create dummy feature maps of different sizes
-    p3 = torch.randn(batch_size, 256, 80, 80).to(device)
-    p4 = torch.randn(batch_size, 512, 40, 40).to(device)
-    p5 = torch.randn(batch_size, 1024, 20, 20).to(device)
-
-    test_cases = [
-        {
-            'name': 'P5 Upsampling',
-            'layer': nn.Upsample(scale_factor=2, mode='nearest'),
-            'input': p5,
-            'expected_shape': (batch_size, 1024, 40, 40)
-        },
-        {
-            'name': 'Feature Concatenation',
-            'layer': torch.cat,
-            'inputs': [p4, p5],
-            'expected_shape': (batch_size, 1536, 40, 40)  # 512 + 1024 channels
-        }
-    ]
-
-    for test_case in test_cases:
-        try:
-            name = test_case['name']
-            print(f"\nTesting {name}")
-            
-            if name == 'Feature Concatenation':
-                # Handle concatenation specially
-                p5_upsampled = nn.Upsample(scale_factor=2, mode='nearest')(test_case['inputs'][1])
-                inputs = [test_case['inputs'][0], p5_upsampled]
-                output = torch.cat(inputs, dim=1)
-            else:
-                output = test_case['layer'](test_case['input'])
-
-            expected_shape = test_case['expected_shape']
-            
-            print(f"Output shape: {output.shape}")
-            print(f"Expected shape: {expected_shape}")
-            assert output.shape == expected_shape, f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-            
-            print("Output statistics:")
-            print(f"  mean: {output.mean().item():.4f}")
-            print(f"  std: {output.std().item():.4f}")
-            print(f"  min: {output.min().item():.4f}")
-            print(f"  max: {output.max().item():.4f}")
-            print("✓ Test passed")
-            
-        except Exception as e:
-            print(f"✗ Test failed for {name}")
-            print(f"Error: {str(e)}")
-            raise e
-
-def test_c3k2_block():
-    """Test C3k2 block specifically."""
-    print("\n=== Testing C3k2 Block ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-    input_channels = 128
-    output_channels = 256
-    input_size = 160
-
-    # Create input tensor
-    x = torch.randn(batch_size, input_channels, input_size, input_size).to(device)
-    print(f"Input shape: {x.shape}")
-
-    try:
-        # Create C3k2 block
-        c3k2 = C3k2(
-            in_channels=input_channels,
-            out_channels=output_channels,
-            n=2,  # Number of bottleneck blocks
-            e=0.5,  # Expansion ratio
-            g=1,  # Groups
-            shortcut=True
-        ).to(device)
-
-        # Test each sub-component of C3k2
-        # First branch: cv1
-        y1 = c3k2.cv1(x)
-        print(f"cv1 output shape: {y1.shape}")
-
-        # Second branch: cv2
-        y2 = c3k2.cv2(x)
-        print(f"cv2 output shape: {y2.shape}")
-
-        # Process through bottleneck blocks
-        y3 = c3k2.m(y1)
-        print(f"Bottleneck blocks output shape: {y3.shape}")
-
-        # Concatenate and final convolution
-        y = torch.cat([y2, y1, y3], dim=1)
-        print(f"Concatenated shape: {y.shape}")
-        
-        output = c3k2.cv3(y)
-        print(f"Final output shape: {output.shape}")
-        
-        expected_shape = (batch_size, output_channels, input_size, input_size)
-        assert output.shape == expected_shape, f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-        
-        print("\nOutput statistics:")
-        print(f"  mean: {output.mean().item():.4f}")
-        print(f"  std: {output.std().item():.4f}")
-        print(f"  min: {output.min().item():.4f}")
-        print(f"  max: {output.max().item():.4f}")
-        print("✓ C3k2 test passed")
-
-    except Exception as e:
-        print("✗ C3k2 test failed")
-        print(f"Error: {str(e)}")
+        print(f"\nError in BboxLoss test: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise e
 
 
-def test_initialization():
-    """Test quaternion weight initialization."""
-    print("\n=== Testing Weight Initialization ===")
+
+def test_bbox_loss():
+    """Test BboxLoss with detailed output."""
+    print("\n=== Testing BboxLoss ===")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Initialize loss functions
+    bbox_loss_standard = BboxLoss(reg_max=16, nc=80, use_quat=False).to(device)
+    bbox_loss_quat = BboxLoss(reg_max=16, nc=80, use_quat=True).to(device)
+    print("Initialized BboxLoss modules")
+    
+    # Create dummy data
+    batch_size = 2
+    h = w = 20
+    num_anchors = h * w  # 400
+    reg_max = 16
+    
+    # Create predictions with proper shapes
+    pred_dist = torch.randn(batch_size, num_anchors, 4 * reg_max, device=device)
+    
+    anchor_points = torch.rand(num_anchors, 2, device=device)
+    
+    # Initialize fg_mask to mark only the assigned anchors as positive
+    fg_mask = torch.zeros(batch_size, num_anchors, device=device, dtype=torch.bool)
+    fg_mask[0, 0] = True
+    fg_mask[0, 1] = True
+    fg_mask[1, 0] = True
+    fg_mask[1, 1] = True
+    # Now fg_mask.sum()=4
+    
+    # Set target_scores: 1.0 for positive anchors, 0.0 otherwise
+    target_scores = torch.zeros(batch_size, num_anchors, device=device)
+    target_scores[fg_mask] = 1.0  # Only positive anchors have score=1.0
+    
+    # Create target boxes with shape [batch_size, num_anchors, 4]
+    target_boxes = torch.zeros(batch_size, num_anchors, 4, device=device)
+    
+    # Assign the two target boxes to the first two anchors of each image
+    target_boxes[0, 0, :] = torch.tensor([0.2, 0.2, 0.4, 0.4], device=device)
+    target_boxes[0, 1, :] = torch.tensor([0.6, 0.6, 0.8, 0.8], device=device)
+    target_boxes[1, 0, :] = torch.tensor([0.3, 0.3, 0.5, 0.5], device=device)
+    target_boxes[1, 1, :] = torch.tensor([0.7, 0.7, 0.9, 0.9], device=device)
     
     try:
-        # Test different layer configurations
-        test_configs = [
-            (4, 64, 3),
-            (64, 128, 3),
-            (128, 256, 3),
-        ]
-
-        for in_ch, out_ch, kernel_size in test_configs:
-            print(f"\nTesting initialization with:")
-            print(f"in_channels={in_ch}, out_channels={out_ch}, kernel_size={kernel_size}")
-            
-            # Create layer
-            layer = QConv2d(in_ch, out_ch, kernel_size)
-            
-            # Initialize weights using QInit
-            initializer = QInit(
-                kernel_size=layer.kernel_size,
-                input_dim=layer.in_channels,
-                weight_dim=2
-            )
-            
-            # Get initialization
-            weight_dict = initializer.initialize(
-                shape=(layer.out_channels, layer.in_channels) + layer.kernel_size,
-                device=layer.modulus.device
-            )
-            
-            # Print statistics
-            print("Modulus stats:")
-            print(f"  mean: {weight_dict['modulus'].mean().item():.4f}")
-            print(f"  std: {weight_dict['modulus'].std().item():.4f}")
-            print("Phase stats:")
-            print(f"  mean: {weight_dict['phase'].mean().item():.4f}")
-            print(f"  std: {weight_dict['phase'].std().item():.4f}")
-
+        print("\nShape information:")
+        print(f"pred_dist shape: {pred_dist.shape}")  # [2, 400, 64]
+        print(f"anchor_points shape: {anchor_points.shape}")  # [400, 2]
+        print(f"fg_mask shape: {fg_mask.shape}")  # [2, 400]
+        print(f"fg_mask sum: {fg_mask.sum()}")  # 4
+        print(f"target_boxes shape: {target_boxes.shape}")  # [2, 400, 4]
+        print(f"target_boxes non-zero count: {(target_boxes != 0).sum()}")  # 16 (4 boxes * 4 values)
+        
+        print("\nTesting standard BboxLoss...")
+        # Decode boxes with proper shapes by passing raw pred_dist
+        pred_bboxes = bbox_loss_standard.bbox_decode(pred_dist, anchor_points)
+        print(f"pred_bboxes shape: {pred_bboxes.shape}")  # [2, 400, 4]
+        
+        loss_components = bbox_loss_standard(
+            pred_dist,
+            pred_bboxes,
+            anchor_points,
+            target_boxes,
+            target_scores,
+            target_scores.sum(),
+            fg_mask
+        )
+        
+        print("Standard BboxLoss components:")
+        print(f"Box loss: {loss_components[0]:.4f}")
+        print(f"DFL loss: {loss_components[1]:.4f}")
+        
+        print("\nTesting quaternion BboxLoss...")
+        # Add quaternion predictions
+        pred_quat = torch.randn(batch_size, num_anchors, 4, device=device)
+        pred_quat = F.normalize(pred_quat, p=2, dim=-1)
+        target_quats = torch.randn(batch_size, num_anchors, 4, device=device)
+        target_quats = F.normalize(target_quats, p=2, dim=-1)
+        
+        loss_components_quat = bbox_loss_quat(
+            pred_dist,
+            pred_bboxes,
+            anchor_points,
+            target_boxes,
+            target_scores,
+            target_scores.sum(),
+            fg_mask,
+            pred_quat,
+            target_quats
+        )
+        
+        print("Quaternion BboxLoss components:")
+        print(f"Box loss: {loss_components_quat[0]:.4f}")
+        print(f"DFL loss: {loss_components_quat[1]:.4f}")
+        print(f"Quaternion loss: {loss_components_quat[2]:.4f}")
+        
     except Exception as e:
-        print("Initialization testing failed")
+        print(f"\nError in BboxLoss test: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise e
 
-def test_fpn():
-    """Test Feature Pyramid Network (FPN) functionality."""
-    print("\n=== Testing FPN ===")
+
+def test_detection_loss():
+    """Test DetectionLoss with detailed output."""
+    print("\n=== Testing DetectionLoss ===")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
+    
+    # Initialize DetectionLoss directly with parameters
+    detection_loss = DetectionLoss(reg_max=16, nc=80, use_quat=True, tal_topk=10).to(device)
+    print("Initialized DetectionLoss module")
+    
+    # Create dummy data
     batch_size = 2
-
-    # Create mock backbone feature maps with proper quaternion channel counts
-    features = [
-        torch.randn(batch_size, 256, 80, 80).to(device),  # P3
-        torch.randn(batch_size, 512, 40, 40).to(device),  # P4
-        torch.randn(batch_size, 1024, 20, 20).to(device)  # P5
-    ]
-
+    num_anchors = 400  # e.g., 20x20 grid
+    reg_max = 16
+    nc = 80
+    
+    # Create dummy predictions
+    # pred_dist: [batch_size, num_anchors, 4 * reg_max]
+    pred_dist = torch.randn(batch_size, num_anchors, 4 * reg_max, device=device)
+    
+    # Create dummy decoded bounding boxes
+    # For testing purposes, let's assume bbox_decode returns random boxes
+    pred_bboxes = torch.randn(batch_size, num_anchors, 4, device=device)
+    
+    # Create dummy anchor points
+    # anchor_points: [num_anchors, 2]
+    anchor_points = torch.rand(num_anchors, 2, device=device)
+    
+    # Create dummy target bounding boxes
+    # target_bboxes: [batch_size, num_anchors, 4]
+    target_bboxes = torch.zeros(batch_size, num_anchors, 4, device=device)
+    # Assign some boxes to specific anchors
+    target_bboxes[0, 0, :] = torch.tensor([0.2, 0.2, 0.4, 0.4], device=device)
+    target_bboxes[0, 1, :] = torch.tensor([0.6, 0.6, 0.8, 0.8], device=device)
+    target_bboxes[1, 0, :] = torch.tensor([0.3, 0.3, 0.5, 0.5], device=device)
+    target_bboxes[1, 1, :] = torch.tensor([0.7, 0.7, 0.9, 0.9], device=device)
+    
+    # Create dummy objectness scores
+    # target_scores: [batch_size, num_anchors]
+    target_scores = torch.zeros(batch_size, num_anchors, device=device)
+    target_scores[0, 0] = 1.0
+    target_scores[0, 1] = 1.0
+    target_scores[1, 0] = 1.0
+    target_scores[1, 1] = 1.0
+    target_scores_sum = target_scores.sum()
+    
+    # Create dummy foreground mask
+    # fg_mask: [batch_size, num_anchors]
+    fg_mask = torch.zeros(batch_size, num_anchors, device=device, dtype=torch.bool)
+    fg_mask[0, 0] = True
+    fg_mask[0, 1] = True
+    fg_mask[1, 0] = True
+    fg_mask[1, 1] = True
+    
+    # Create dummy quaternions
+    # pred_quat and target_quat: [batch_size, num_anchors, 4]
+    pred_quat = F.normalize(torch.randn(batch_size, num_anchors, 4, device=device), p=2, dim=-1)
+    target_quat = F.normalize(torch.randn(batch_size, num_anchors, 4, device=device), p=2, dim=-1)
+    
     try:
-        # Create FPN
-        fpn = QuaternionFPN(
-            in_channels=[256, 512, 1024],
-            out_channels=256
-        ).to(device)
+        print("\nShape information:")
+        print(f"pred_dist shape: {pred_dist.shape}")  # [2, 400, 64]
+        print(f"pred_bboxes shape: {pred_bboxes.shape}")  # [2, 400, 4]
+        print(f"anchor_points shape: {anchor_points.shape}")  # [400, 2]
+        print(f"fg_mask shape: {fg_mask.shape}")  # [2, 400]
+        print(f"fg_mask sum: {fg_mask.sum()}")  # 4
+        print(f"target_bboxes shape: {target_bboxes.shape}")  # [2, 400, 4]
+        print(f"target_bboxes non-zero count: {(target_bboxes != 0).sum()}")  # 16
+        print(f"target_scores shape: {target_scores.shape}")  # [2, 400]
+        print(f"target_scores_sum: {target_scores_sum.item()}")  # 4.0
+        print(f"pred_quat shape: {pred_quat.shape}")  # [2, 400, 4]
+        print(f"target_quat shape: {target_quat.shape}")  # [2, 400, 4]
         
-        print("Input feature shapes:")
-        for i, feat in enumerate(features):
-            print(f"P{i+3}: {feat.shape}")
-
-        # Forward pass through FPN
-        fpn_outputs = fpn(features)
+        print("\nTesting DetectionLoss...")
+        # Compute loss
+        box_loss, dfl_loss, quat_loss = detection_loss(
+            pred_dist, 
+            pred_bboxes, 
+            anchor_points, 
+            target_bboxes, 
+            target_scores, 
+            target_scores_sum, 
+            fg_mask, 
+            pred_quat, 
+            target_quat
+        )
         
-        print("\nFPN output shapes:")
-        for i, out in enumerate(fpn_outputs):
-            print(f"P{i+3}: {out.shape}")
-            
-        # Expected shapes (all with 256 channels)
-        expected_shapes = [
-            (batch_size, 256, 80, 80),  # P3
-            (batch_size, 256, 40, 40),  # P4
-            (batch_size, 256, 20, 20)   # P5
-        ]
-        
-        # Verify shapes
-        for output, expected_shape in zip(fpn_outputs, expected_shapes):
-            assert output.shape == expected_shape, \
-                f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-        
-        print("✓ FPN test passed")
-
+        print("DetectionLoss components:")
+        print(f"Box loss: {box_loss.item():.4f}")
+        print(f"DFL loss: {dfl_loss.item():.4f}")
+        if detection_loss.use_quat:
+            print(f"Quaternion loss: {quat_loss.item():.4f}")
     except Exception as e:
-        print("✗ FPN test failed")
-        print(f"Error: {str(e)}")
+        print(f"\nError in DetectionLoss test: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise e
 
-def test_pan():
-    """Test Path Aggregation Network (PAN) functionality."""
-    print("\n=== Testing PAN ===")
+
+def test_full_training_loop():
+    """Test losses in a mock training loop."""
+    print("\n=== Testing Losses in Training Loop ===")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    detection_loss = DetectionLoss(nc=80, reg_max=16, use_quat=True).to(device)
+    
+    # Mock training loop
+    print("\nRunning mock training loop...")
+    for i in range(3):
+        predictions, targets = create_dummy_data(device=device)
+        
+        # Calculate loss
+        with torch.cuda.amp.autocast():
+            loss = detection_loss(predictions, targets)
+        
+        total_loss = loss.sum()
+        print(f"\nIteration {i+1}:")
+        print(f"Total loss: {total_loss:.4f}")
+        print(f"Box loss: {loss[0]:.4f}")
+        print(f"Classification loss: {loss[1]:.4f}")
+        print(f"DFL loss: {loss[2]:.4f}")
+        print(f"Quaternion loss: {loss[3]:.4f}")
 
-    # Create mock FPN outputs
-    fpn_features = [
-        torch.randn(batch_size, 256, 80, 80).to(device),  # P3
-        torch.randn(batch_size, 256, 40, 40).to(device),  # P4
-        torch.randn(batch_size, 256, 20, 20).to(device)   # P5
-    ]
-
+def test_dist2bbox():
+    """Test distance to bbox conversion."""
+    print("\n=== Testing dist2bbox conversion ===")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Create sample inputs
+    anchor_points = torch.tensor([[10., 10.], [20., 20.]], device=device)
+    distance = torch.tensor([[2., 2., 1., 1.], [3., 3., 1.5, 1.5]], device=device)
+    
     try:
-        # Create PAN
-        pan = QuaternionPAN(
-            in_channels=[256, 256, 256],
-            out_channels=256
-        ).to(device)
+        # Test single batch
+        boxes = dist2bbox(distance, anchor_points, xywh=True)
+        print(f"Single batch output shape: {boxes.shape}")
+        print(f"Sample boxes:\n{boxes}")
         
-        print("Input feature shapes:")
-        for i, feat in enumerate(fpn_features):
-            print(f"P{i+3}: {feat.shape}")
-
-        # Forward pass through PAN
-        pan_outputs = pan(fpn_features)
+        # Test batched input
+        distance_batch = distance.unsqueeze(0).expand(2, -1, -1)
+        boxes_batch = dist2bbox(distance_batch, anchor_points, xywh=True)
+        print(f"\nBatched output shape: {boxes_batch.shape}")
         
-        print("\nPAN output shapes:")
-        for i, out in enumerate(pan_outputs):
-            print(f"P{i+3}: {out.shape}")
-            
-        # Expected shapes
-        expected_shapes = [
-            (batch_size, 256, 80, 80),  # P3
-            (batch_size, 256, 40, 40),  # P4
-            (batch_size, 256, 20, 20)   # P5
-        ]
-        
-        # Verify shapes and stats
-        for i, (output, expected_shape) in enumerate(zip(pan_outputs, expected_shapes)):
-            print(f"\nP{i+3} statistics:")
-            print(f"  mean: {output.mean().item():.4f}")
-            print(f"  std: {output.std().item():.4f}")
-            print(f"  min: {output.min().item():.4f}")
-            print(f"  max: {output.max().item():.4f}")
-            
-            assert output.shape == expected_shape, \
-                f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-        
-        print("✓ PAN test passed")
-
     except Exception as e:
-        print("✗ PAN test failed")
-        print(f"Error: {str(e)}")
+        print(f"Error in dist2bbox test: {str(e)}")
         raise e
 
-def test_full_neck():
-    """Test the full neck (FPN + PAN) functionality."""
-    print("\n=== Testing Full Neck (FPN + PAN) ===")
+
+def main():
+    """Run all tests."""
+    print("Starting loss function tests...")
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-
     try:
-        # Create mock backbone features
-        backbone_features = [
-            torch.randn(batch_size, 256, 80, 80).to(device),  # P3
-            torch.randn(batch_size, 512, 40, 40).to(device),  # P4
-            torch.randn(batch_size, 1024, 20, 20).to(device)  # P5
-        ]
-
-        # Create FPN and PAN
-        fpn = QuaternionFPN(
-            in_channels=[256, 512, 1024],
-            out_channels=256
-        ).to(device)
+        # test_dist2bbox()
+        # test_bbox_conversions()
+        # test_bbox_iou()
+        # test_anchor_generation()
+        test_detection_loss()
+        test_bbox_loss()
+        print("\nAll tests completed successfully!")
         
-        pan = QuaternionPAN(
-            in_channels=[256, 256, 256],
-            out_channels=256
-        ).to(device)
-
-        # Full forward pass
-        fpn_outputs = fpn(backbone_features)
-        final_outputs = pan(fpn_outputs)
-
-        # Verify final output shapes
-        expected_shapes = [
-            (batch_size, 256, 80, 80),  # P3
-            (batch_size, 256, 40, 40),  # P4
-            (batch_size, 256, 20, 20)   # P5
-        ]
-
-        print("\nFinal output shapes and statistics:")
-        for i, (output, expected_shape) in enumerate(zip(final_outputs, expected_shapes)):
-            print(f"\nOutput {i} (P{i+3}):")
-            print(f"Shape: {output.shape} (expected: {expected_shape})")
-            print(f"Statistics:")
-            print(f"  mean: {output.mean().item():.4f}")
-            print(f"  std: {output.std().item():.4f}")
-            print(f"  min: {output.min().item():.4f}")
-            print(f"  max: {output.max().item():.4f}")
-            
-            assert output.shape == expected_shape, \
-                f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-
-        print("✓ Full neck test passed")
-
     except Exception as e:
-        print("✗ Full neck test failed")
-        print(f"Error: {str(e)}")
-        raise e
-
-def test_detection_heads():
-    """Test both detection and OBB heads."""
-    print("\n=== Testing Detection Heads ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-
-    # Create mock feature maps with quaternion dimension
-    features = [
-        torch.randn(batch_size, 256, 4, 80, 80).to(device),  # P3 features
-        torch.randn(batch_size, 512, 4, 40, 40).to(device),  # P4 features
-        torch.randn(batch_size, 1024, 4, 20, 20).to(device)  # P5 features
-    ]
-
-    try:
-        # Test Detection Head
-        print("\nTesting QDetectHead:")
-        detect_head = QDetectHead(nc=80, ch=[256, 512, 1024]).to(device)
-        detect_outputs = detect_head(features)
-        
-        for i, output in enumerate(detect_outputs):
-            print(f"\nP{i+3} output:")
-            print(f"Shape: {output.shape}")
-            print(f"Stats:")
-            print(f"  mean: {output.mean().item():.4f}")
-            print(f"  std: {output.std().item():.4f}")
-            print(f"  min: {output.min().item():.4f}")
-            print(f"  max: {output.max().item():.4f}")
-        
-        # Test OBB Head
-        print("\nTesting QOBBHead:")
-        obb_head = QOBBHead(nc=80, ch=[256, 512, 1024]).to(device)
-        obb_outputs = obb_head(features)
-        
-        for i, output in enumerate(obb_outputs):
-            print(f"\nP{i+3} output:")
-            print(f"Shape: {output.shape}")
-            print(f"Stats:")
-            print(f"  mean: {output.mean().item():.4f}")
-            print(f"  std: {output.std().item():.4f}")
-            print(f"  min: {output.min().item():.4f}")
-            print(f"  max: {output.max().item():.4f}")
-        
-        print("\n✓ All head tests passed!")
-
-    except Exception as e:
-        print(f"\n✗ Head tests failed!")
-        print(f"Error: {str(e)}")
-        raise e
-
-def test_sppf():
-    """Test Spatial Pyramid Pooling - Fast (SPPF) module."""
-    print("\n=== Testing SPPF ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-    in_channels = 1024  # Common channel size where SPPF is used
-    out_channels = 1024
-    spatial_size = 20   # Common spatial size at this stage
-
-    try:
-        # Create input tensor
-        x = torch.randn(batch_size, in_channels, spatial_size, spatial_size).to(device)
-        print(f"Input shape: {x.shape}")
-
-        # Create SPPF module
-        sppf = SPPF(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=5
-        ).to(device)
-
-        # Forward pass
-        output = sppf(x)
-        
-        # Expected shape
-        expected_shape = (batch_size, out_channels, spatial_size, spatial_size)
-        
-        print(f"Output shape: {output.shape}")
-        print(f"Expected shape: {expected_shape}")
-        
-        assert output.shape == expected_shape, \
-            f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-
-        # Print statistics
-        print("\nOutput statistics:")
-        print(f"  mean: {output.mean().item():.4f}")
-        print(f"  std: {output.std().item():.4f}")
-        print(f"  min: {output.min().item():.4f}")
-        print(f"  max: {output.max().item():.4f}")
-        
-        print("✓ SPPF test passed")
-
-    except Exception as e:
-        print("✗ SPPF test failed")
-        print(f"Error: {str(e)}")
-        raise e
-
-def test_c2psa():
-    """Test C2PSA (Channel-wise Position Sensitive Attention) module."""
-    print("\n=== Testing C2PSA ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-    in_channels = 1024
-    out_channels = 1024
-    spatial_size = 20
-
-    try:
-        # Create input tensor
-        x = torch.randn(batch_size, in_channels, spatial_size, spatial_size).to(device)
-        print(f"Input shape: {x.shape}")
-
-        # Create mock guide tensor if needed by your implementation
-        guide = torch.randn(batch_size, 512).to(device)  # Adjust size based on your implementation
-        
-        # Create C2PSA module
-        c2psa = C2PSA(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            n=1  # Number of PSA blocks
-        ).to(device)
-
-        # Test each component of C2PSA
-        print("\nTesting C2PSA components:")
-        
-        # Initial split and convolution
-        y = c2psa.cv1(x)
-        print(f"After cv1 shape: {y.shape}")
-
-        # First path (PSA blocks)
-        if hasattr(c2psa, 'm'):
-            y_psa = c2psa.m(y)
-            print(f"After PSA blocks shape: {y_psa.shape}")
-
-        # Forward pass with guide if needed
-        if 'guide' in inspect.signature(c2psa.forward).parameters:
-            output = c2psa(x, guide)
-        else:
-            output = c2psa(x)
-        
-        # Expected shape
-        expected_shape = (batch_size, out_channels, spatial_size, spatial_size)
-        
-        print(f"\nFinal output shape: {output.shape}")
-        print(f"Expected shape: {expected_shape}")
-        
-        assert output.shape == expected_shape, \
-            f"Shape mismatch: got {output.shape}, expected {expected_shape}"
-
-        # Print statistics
-        print("\nOutput statistics:")
-        print(f"  mean: {output.mean().item():.4f}")
-        print(f"  std: {output.std().item():.4f}")
-        print(f"  min: {output.min().item():.4f}")
-        print(f"  max: {output.max().item():.4f}")
-        
-        print("✓ C2PSA test passed")
-
-    except Exception as e:
-        print("✗ C2PSA test failed")
-        print(f"Error: {str(e)}")
-        raise e
-
-def test_integration():
-    """Test SPPF and C2PSA integration."""
-    print("\n=== Testing SPPF + C2PSA Integration ===")
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    batch_size = 2
-    in_channels = 1024
-    spatial_size = 20
-
-    try:
-        # Create input tensor
-        x = torch.randn(batch_size, in_channels, spatial_size, spatial_size).to(device)
-        print(f"Input shape: {x.shape}")
-
-        # Create modules
-        sppf = SPPF(in_channels=in_channels, out_channels=in_channels).to(device)
-        c2psa = C2PSA(in_channels=in_channels, out_channels=in_channels).to(device)
-
-        # Forward pass through SPPF
-        sppf_out = sppf(x)
-        print(f"After SPPF shape: {sppf_out.shape}")
-
-        # Forward pass through C2PSA
-        final_out = c2psa(sppf_out)
-        print(f"After C2PSA shape: {final_out.shape}")
-
-        # Expected shape
-        expected_shape = (batch_size, in_channels, spatial_size, spatial_size)
-        assert final_out.shape == expected_shape, \
-            f"Shape mismatch: got {final_out.shape}, expected {expected_shape}"
-
-        # Print statistics
-        print("\nFinal output statistics:")
-        print(f"  mean: {final_out.mean().item():.4f}")
-        print(f"  std: {final_out.std().item():.4f}")
-        print(f"  min: {final_out.min().item():.4f}")
-        print(f"  max: {final_out.max().item():.4f}")
-        
-        print("✓ Integration test passed")
-
-    except Exception as e:
-        print("✗ Integration test failed")
-        print(f"Error: {str(e)}")
+        print(f"\nTest failed with error: {str(e)}")
         raise e
 
 if __name__ == "__main__":
-    import inspect  # For inspecting function signatures
-    
-    try:
-        print("Starting SPPF and C2PSA tests...")
-        test_sppf()
-        test_c2psa()
-        test_integration()
-        print("\nAll tests completed successfully! ✓")
-    except Exception as e:
-        print(f"\nTests failed! ✗")
-        print(f"Error: {str(e)}")
-
+    main()

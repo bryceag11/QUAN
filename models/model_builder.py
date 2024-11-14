@@ -4,7 +4,7 @@ import torch.nn as nn
 import yaml
 from quaternion.conv import QConv, QConv2d
 from quaternion.init import QInit
-from .blocks.block import C3k2, SPPF, C2PSA 
+from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape
 from .neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN
 from .heads.qdet_head import QDetectHead, QOBBHead
 import torch 
@@ -21,23 +21,18 @@ from quaternion import QInit
 
 def initialize_weights(layer):
     """
-    Initialize weights for a layer, including quaternion layers.
+    Initialize weights for a layer.
     """
-    if isinstance(layer, QConv) or isinstance(layer, QConv2d):
-        initializer = QInit(
-            kernel_size=layer.kernel_size,
-            input_dim=layer.in_channels,
-            weight_dim=layer.rank
-        )
-        weight_dict = initializer.initialize(layer.modulus.shape, device=layer.modulus.device)
-        layer.modulus.data = weight_dict['modulus']
-        layer.phase.data = weight_dict['phase']
-    elif hasattr(layer, 'weight') and layer.weight is not None:
+    if hasattr(layer, 'weight') and layer.weight is not None:
+        # Initialize standard layers
         torch.nn.init.kaiming_uniform_(layer.weight, a=math.sqrt(5))
         if hasattr(layer, 'bias') and layer.bias is not None:
             fan_in, _ = torch.nn.init._calculate_fan_in_and_fan_out(layer.weight)
             bound = 1 / math.sqrt(fan_in)
             torch.nn.init.uniform_(layer.bias, -bound, bound)
+    else:
+        # Skip weight initialization for QConv and QConv2d layers
+        pass
 
 def load_model_from_yaml(config_path):
     """
@@ -60,8 +55,10 @@ def load_model_from_yaml(config_path):
     # Define your module dictionary
     module_dict = {
         'QConv': QConv,
+        'Reshape': Reshape,
         'QConv2d': QConv2d,
         'C3k2': C3k2,
+        'PSABlock': PSABlock,
         'SPPF': SPPF,
         'C2PSA': C2PSA,
         'nn.Upsample': nn.Upsample,
@@ -84,54 +81,60 @@ def load_model_from_yaml(config_path):
 
 def build_from_cfg(cfg, module_dict):
     """
-    Build a module from config.
+    Build a module from the configuration.
 
     Args:
         cfg (list): List of layer configurations.
-        module_dict (dict): Dictionary mapping layer names to their implementations.
+        module_dict (dict): Mapping from layer names to their implementations.
 
     Returns:
         nn.Sequential: The constructed model layers.
     """
     layers = []
-    for layer_cfg in cfg:
+    for idx, layer_cfg in enumerate(cfg):
         if isinstance(layer_cfg, list):
-            # Example: [-1, 1, QConv2d, [in_channels=3, out_channels=64, kernel_size=3, stride=2]]
-            in_idx, num_repeat, layer_type, layer_args = layer_cfg
-            if isinstance(layer_args, list):
-                # Parse key=value strings into a dictionary
-                args_dict = {}
-                for arg in layer_args:
+            # Unpack layer configuration
+            from_idx, num_repeats, module_name, module_args = layer_cfg
+
+            # Process module arguments
+            if isinstance(module_args, dict):
+                args = module_args
+            elif isinstance(module_args, list):
+                # Convert list of key=value strings to dict
+                args = {}
+                for arg in module_args:
                     if isinstance(arg, str) and '=' in arg:
                         key, value = arg.split('=')
-                        # Convert to appropriate type
-                        try:
-                            value = int(value)
-                        except ValueError:
+                        key = key.strip()
+                        value = value.strip()
+                        # Convert value to appropriate type
+                        if value.lower() == 'true':
+                            value = True
+                        elif value.lower() == 'false':
+                            value = False
+                        else:
                             try:
-                                value = float(value)
+                                value = int(value)
                             except ValueError:
-                                pass  # Keep as string
-                        args_dict[key] = value
-                    else:
-                        # Handle positional arguments if any (not recommended)
-                        pass
+                                try:
+                                    value = float(value)
+                                except ValueError:
+                                    pass  # Keep as string
+                        args[key] = value
             else:
-                args_dict = layer_args  # Assuming it's already a dict
+                args = {}
 
-            # Instantiate the layer with keyword arguments
-            layer = module_dict[layer_type](**args_dict)
+            module_class = module_dict.get(module_name)
+            if module_class is None:
+                raise ValueError(f"Module '{module_name}' not found in module_dict.")
 
-            # Apply weight initialization
-            initialize_weights(layer)
-
-            # Handle multiple repeats by creating new instances each time to avoid weight sharing
-            for _ in range(num_repeat):
-                # For each repeat, instantiate a new layer with the same arguments
-                layer = module_dict[layer_type](**args_dict)
-                initialize_weights(layer)
-                layers.append(layer)
-        elif isinstance(layer_cfg, dict):
-            # Handle more complex configurations if needed
+            # Instantiate the module
+            for _ in range(num_repeats):
+                module_instance = module_class(**args)
+                initialize_weights(module_instance)
+                layers.append(module_instance)
+                # print(f"Added layer {idx}: {module_name} with args {args}")
+        else:
+            # Handle other configurations if necessary
             pass
     return nn.Sequential(*layers)

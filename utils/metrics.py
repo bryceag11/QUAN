@@ -773,80 +773,83 @@ class DetMetrics(SimpleClass):
 
 # utils/metrics.py
 
-import torch
 
 class OBBMetrics:
-    def __init__(self, save_dir, plot=True, names=None):
-        """
-        Initialize the Metrics class.
-
-        Args:
-            save_dir (str): Directory to save metrics and plots.
-            plot (bool, optional): Whether to generate plots.
-            names (dict, optional): Mapping from class indices to class names.
-        """
+    def __init__(self, nc, save_dir, plot=True):
+        self.nc = nc  # number of classes
         self.save_dir = save_dir
         self.plot = plot
-        self.names = names if names is not None else {}
-        self.reset()
-    
-    def reset(self):
-        """
-        Reset all metrics.
-        """
-        self.tp = 0
-        self.fp = 0
-        self.fn = 0
-        self.total = 0
-        # Add other metric-related initializations as needed
-    
-    def update(self, preds, target_bboxes, target_categories, target_quats, bbox_types):
-        """
-        Update metrics with predictions and targets.
+        
+        # Initialize metric storage
+        self.metrics = {
+            'train': {'loss': [], 'map': [], 'map50': [], 'map75': []},
+            'val': {'loss': [], 'map': [], 'map50': [], 'map75': []}
+        }
+        
+        # Create metrics directory
+        self.metrics_dir = os.path.join(save_dir, 'metrics')
+        os.makedirs(self.metrics_dir, exist_ok=True)
 
-        Args:
-            preds (torch.Tensor): Predictions from the model.
-            target_bboxes (torch.Tensor): Ground truth bounding boxes.
-            target_categories (torch.Tensor): Ground truth categories.
-            target_quats (torch.Tensor): Ground truth quaternions.
-            bbox_types (torch.Tensor): Type of bounding boxes (0: OBB, 1: XYWH).
-        """
-        # Implement metric updates (e.g., IoU calculations, precision, recall)
-        # Placeholder implementation
-        # You need to replace this with actual metric computations
-        pass
+    def update(self, epoch, train_metrics=None, val_metrics=None):
+        """Update metrics with new values."""
+        if train_metrics:
+            for k, v in train_metrics.items():
+                self.metrics['train'][k].append(v)
+        
+        if val_metrics:
+            for k, v in val_metrics.items():
+                self.metrics['val'][k].append(v)
+        
+        # Save metrics to file
+        self._save_metrics()
 
-    def compute(self):
-        """
-        Compute final metrics.
-        """
-        # Implement final metric computations (e.g., mAP)
-        pass
+    def plot(self):
+        """Plot training and validation metrics."""
+        if not self.plot:
+            return
+            
+        # Create figure directory
+        fig_dir = os.path.join(self.metrics_dir, 'figures')
+        os.makedirs(fig_dir, exist_ok=True)
+        
+        # Plot metrics
+        metrics_to_plot = ['loss', 'map', 'map50', 'map75']
+        
+        for metric in metrics_to_plot:
+            plt.figure(figsize=(10, 6))
+            
+            # Plot training metrics
+            if len(self.metrics['train'][metric]) > 0:
+                plt.plot(self.metrics['train'][metric], label=f'Train {metric}')
+            
+            # Plot validation metrics
+            if len(self.metrics['val'][metric]) > 0:
+                plt.plot(self.metrics['val'][metric], label=f'Val {metric}')
+            
+            plt.title(f'{metric} over Time')
+            plt.xlabel('Epoch')
+            plt.ylabel(metric)
+            plt.legend()
+            plt.grid(True)
+            
+            # Save plot
+            plt.savefig(os.path.join(fig_dir, f'{metric}.png'))
+            plt.close()
 
-    def visualize(self, save_dir):
-        """
-        Generate and save visualizations for metrics.
+    def _save_metrics(self):
+        """Save metrics to file."""
+        metrics_file = os.path.join(self.metrics_dir, 'metrics.json')
+        with open(metrics_file, 'w') as f:
+            json.dump(self.metrics, f, indent=4)
 
-        Args:
-            save_dir (str): Directory to save visualizations.
-        """
-        if self.plot:
-            # Implement visualization (e.g., PR curves, confusion matrices)
-            pass
-
-    def plot_final_metrics(self, save_dir, names):
-        """
-        Plot and save final metrics.
-
-        Args:
-            save_dir (str): Directory to save plots.
-            names (dict): Mapping from class indices to class names.
-        """
-        if self.plot:
-            # Implement final metric plots
-            pass
-
-
+    def get_current_metrics(self):
+        """Get the most recent metrics."""
+        current_metrics = {}
+        for phase in ['train', 'val']:
+            for metric, values in self.metrics[phase].items():
+                if values:  # if not empty
+                    current_metrics[f'{phase}_{metric}'] = values[-1]
+        return current_metrics
 
 def bbox_iou(box1, box2, quats1=None, quats2=None, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
     """

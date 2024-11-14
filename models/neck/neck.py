@@ -2,35 +2,97 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, List, Union
 from quaternion.conv import QConv, QConv1d, QConv2d, QConv3d
 from quaternion.qactivation import QHardTanh, QLeakyReLU, QuaternionActivation, QReLU, QPReLU, QREReLU, QSigmoid, QTanh
 from quaternion.qbatch_norm import QBN, IQBN, VQBN
+import math 
+import numpy as np
+import torch
+import torch.nn as nn
 
 
 class QuaternionConcat(nn.Module):
-    """
-    Concatenation layer for quaternion tensors.
-    """
-    def __init__(self, dim=1):
+    def __init__(self, dim=1, reduce=True, target_channels=None):
+        """
+        Initialize the QuaternionConcat module.
+
+        Args:
+            dim (int): The dimension along which to concatenate.
+            reduce (bool): Whether to reduce the number of channels after concatenation.
+            target_channels (int, optional): The desired number of channels after reduction.
+        """
         super(QuaternionConcat, self).__init__()
         self.dim = dim
-    
-    def forward(self, x):
+        self.reduce = reduce
+        self.target_channels = target_channels
+
+        if self.reduce:
+            if self.target_channels is None:
+                raise ValueError("target_channels must be specified when reduce=True")
+            # 1x1 convolution to reduce channels, initialized later
+            self.reduction_conv = None  # To be set dynamically in forward
+            self.bn = None
+            self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x: list) -> torch.Tensor:
         """
-        Concatenates a list of tensors along the specified dimension.
-        
+        Forward pass for QuaternionConcat.
+
         Args:
-            x (list): List of tensors to concatenate. Each tensor should have channel counts as multiples of 4.
-        
+            x (list): List of tensors to concatenate.
+
         Returns:
-            torch.Tensor: Concatenated tensor.
+            torch.Tensor: Concatenated (and possibly reduced) tensor.
         """
-        # Verify all tensors have channel multiples of 4
-        for tensor in x:
-            assert tensor.shape[1] % 4 == 0, "All concatenated tensors must have channels as multiples of 4."
-        
-        return torch.cat(x, dim=self.dim)
+        # Debug shapes
+        # print("\nQuaternionConcat Input Shapes:")
+        # for i, t in enumerate(x):
+        #     print(f"Input tensor {i}: {t.shape}")
+
+        # Ensure all tensors have batch dimension
+        processed = []
+        batch_size = None
+        for t in x:
+            if t.dim() == 3:
+                t = t.unsqueeze(0)  # [1, C, H, W]
+            elif t.dim() != 4:
+                raise ValueError(f"Unexpected tensor shape: {t.shape}")
+            processed.append(t)
+            if batch_size is None:
+                batch_size = t.shape[0]
+            elif batch_size != t.shape[0]:
+                raise ValueError("All tensors must have the same batch size")
+
+        # Ensure spatial sizes match by cropping to the smallest height and width
+        h_min = min(t.shape[2] for t in processed)
+        w_min = min(t.shape[3] for t in processed)
+        # Crop tensors to min height and width
+        processed = [t[:, :, :h_min, :w_min] for t in processed]
+        # Debug after cropping
+        # for i, t in enumerate(processed):
+        #     print(f"Input tensor {i} after cropping: {t.shape}")
+
+        # Concatenate along the specified dimension
+        out = torch.cat(processed, dim=self.dim)
+
+        if self.reduce:
+            if self.reduction_conv is None:
+                in_channels = out.shape[1]
+                self.reduction_conv = nn.Conv2d(
+                    in_channels=in_channels,
+                    out_channels=self.target_channels,
+                    kernel_size=1,
+                    bias=False
+                ).to(out.device)
+                nn.init.kaiming_uniform_(self.reduction_conv.weight, a=math.sqrt(5))
+                self.bn = nn.BatchNorm2d(self.target_channels).to(out.device)
+            out = self.reduction_conv(out)
+            out = self.bn(out)
+            out = self.relu(out)
+
+        return out
+    
 
 class QuaternionFPN(nn.Module):
     """Feature Pyramid Network for Quaternion Neural Networks."""
