@@ -63,10 +63,26 @@ class Trainer:
             'dfl_loss': 0.0,
             'quat_loss': 0.0
         }
-        
+
         for batch_idx, batch in progress_bar:
-            # Zero gradients
-            self.optimizer.zero_grad()
+            # Clear memory and gradients
+            torch.cuda.empty_cache()
+            self.optimizer.zero_grad(set_to_none=True)
+            
+            # Check batch validity
+            if batch['bbox'].numel() == 0:
+                print(f"\nSkipping empty batch {batch_idx}")
+                continue
+
+            self.optimizer.zero_grad(set_to_none=True)
+            
+
+            # Print batch stats
+            print(f"\nBatch {batch_idx} content:")
+            print(f"Images: {batch['image'].shape}")
+            print(f"Boxes: {batch['bbox'].shape}")
+            print(f"Categories: {batch['category'].shape}")
+            print(f"Valid boxes: {(batch['bbox'].sum(dim=-1) != 0).sum()}")
             
             # Move data to device
             images = batch['image'].to(self.device, non_blocking=True)
@@ -76,16 +92,31 @@ class Trainer:
             # Memory after data loading
             allocated_mem = torch.cuda.memory_allocated(device=self.device) / 1e6
             reserved_mem = torch.cuda.memory_reserved(device=self.device) / 1e6
+            
             print(f"[Batch {batch_idx}] After data loading:")
             print(f"Allocated: {allocated_mem:.2f} MB")
             print(f"Reserved: {reserved_mem:.2f} MB")
             
             try:
+                with torch.set_grad_enabled(True):
                 # # Forward pass with autocast
                 # with torch.amp.autocast("cuda"):
                     preds = self.model(images)  # [B, C, 4, H, W]
                     pred = preds[0]  # Assuming preds is a list or tuple, adjust if necessary
                     
+
+                    # Validate predictions
+                    if pred is None or pred.numel() == 0:
+                        print(f"Empty predictions in batch {batch_idx}")
+                        continue
+                        
+                    # Check prediction stats
+                    print(f"\nPrediction stats:")
+                    print(f"Shape: {pred.shape}")
+                    print(f"Mean: {pred.mean().item():.4f}")
+                    print(f"Std: {pred.std().item():.4f}")
+                    print(f"Requires grad: {pred.requires_grad}")
+
                     B, C, D, H, W = pred.shape
                     num_anchors = H * W
                     
@@ -149,16 +180,21 @@ class Trainer:
                     )
                     
                     # Mean losses
-                    box_loss = box_loss.mean()
-                    dfl_loss = dfl_loss.mean()
+                    box_loss = box_loss
+                    dfl_loss = dfl_loss
                     if quat_loss is not None:
-                        quat_loss = quat_loss.mean()
+                        quat_loss = quat_loss
                     
+                    # Ensure losses require grad
+                    print(f"box_loss requires_grad: {box_loss.requires_grad}")
+                    print(f"dfl_loss requires_grad: {dfl_loss.requires_grad}")
                     # Total loss
                     total_loss = box_loss + dfl_loss
                     if quat_loss is not None:
                         total_loss += quat_loss
                     
+                    print(f"total_loss requires_grad: {total_loss.requires_grad}")
+                    print(f"total_loss grad_fn: {total_loss.grad_fn}")
                     # Check for non-finite losses
                     if not torch.isfinite(total_loss):
                         print(f"\nError: Non-finite loss detected at batch {batch_idx}!")
@@ -215,6 +251,7 @@ class Trainer:
                         'loss': f"{total_loss.item():.4f}",
                         'box': f"{box_loss.item():.4f}",
                         'dfl': f"{dfl_loss.item():.4f}",
+                        'quat': f"{quat_loss.item():.4f}"
                     })
                     progress_bar.refresh()
             
@@ -222,6 +259,12 @@ class Trainer:
                 print(f"\nError during backward/optimizer step in batch {batch_idx}:")
                 print(f"Error type: {type(e)}")
                 print(f"Error message: {str(e)}")
+                print("\nLast tensor states:")
+                print(f"pred_dist shape: {pred_dist.shape}")
+                print(f"pred_bboxes shape: {pred_bboxes.shape}")
+                print(f"box_loss: {box_loss}")
+                print(f"dfl_loss: {dfl_loss}")
+                print(f"total_loss: {total_loss}")
                 print("\nCUDA Memory Status:")
                 print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
                 print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")

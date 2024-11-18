@@ -4,7 +4,7 @@ opencv-python
 Pillow
 PyYAML
 requests
-scipy
+scikit-learn
 tqdm
 seaborn
 pandas

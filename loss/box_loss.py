@@ -99,6 +99,7 @@ class FocalLoss(nn.Module):
             loss *= alpha_factor
 
         return loss.mean(1).sum()
+
 class DFLoss(nn.Module):
     """Criterion class for computing Distribution Focal Loss (DFL) for bounding boxes."""
 
@@ -161,7 +162,7 @@ class DFLoss(nn.Module):
 
 
 class BboxLoss(nn.Module):
-    def __init__(self, reg_max=16, nc=80, use_quat=False):
+    def __init__(self, reg_max=16, nc=80, use_quat=True):
         super().__init__()
         self.reg_max = reg_max
         self.nc = nc
@@ -175,69 +176,189 @@ class BboxLoss(nn.Module):
             self.geo_consistency_loss = GeometricConsistencyLoss(lambda_geo=0.5)
             self.orientation_smoothness_loss = OrientationSmoothnessLoss(lambda_smooth=0.3)
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, 
-                target_scores_sum, fg_mask, pred_quat=None, target_quat=None):
-        """
-        Calculate all components of the box loss.
+    # in trainer.py
+    def train_one_epoch(self, epoch):
+        """Train for one epoch."""
+        self.model.train()
         
-        Args:
-            pred_dist: shape (batch_size, num_anchors, 4 * reg_max)
-            pred_bboxes: shape (batch_size, num_anchors, 4)
-            anchor_points: shape (num_anchors, 2)
-            target_bboxes: shape (batch_size, num_anchors, 4)
-            target_scores: shape (batch_size, num_anchors)
-            target_scores_sum: scalar
-            fg_mask: shape (batch_size, num_anchors)
-        """
-        # Initialize losses
-        device = pred_dist.device
-        box_loss = torch.tensor(0., device=device)
-        dfl_loss = torch.tensor(0., device=device)
-        quat_loss = torch.tensor(0., device=device)
-
-        if fg_mask.sum():
-            # Expand anchor points to match batch dimension
-            batch_size = pred_dist.shape[0]
-            expanded_anchor_points = anchor_points.unsqueeze(0).expand(batch_size, -1, -1)
-            
-            # Calculate DFL loss for each component
-            if self.use_dfl:
-                dist_pred_pos = pred_dist[fg_mask]  # Shape: (num_pos, 4 * reg_max)
-                anchor_points_pos = expanded_anchor_points[fg_mask]  # Shape: (num_pos, 2)
-                target_bboxes_pos = target_bboxes[fg_mask]  # Shape: (num_pos, 4)
+        # Verify model is in training mode
+        print(f"\nStarting epoch {epoch}")
+        print(f"Model training mode: {self.model.training}")
+        trainable_params = sum(p.requires_grad for p in self.model.parameters())
+        print(f"Trainable parameters: {trainable_params}")
+        
+        progress_bar = tqdm(enumerate(self.train_dataloader), total=len(self.train_dataloader))
+        
+        epoch_metrics = {
+            'total_loss': 0.0,
+            'box_loss': 0.0,
+            'dfl_loss': 0.0,
+            'quat_loss': 0.0
+        }
+        
+        for batch_idx, batch in progress_bar:
+            try:
+                # Clear memory and gradients
+                torch.cuda.empty_cache()
+                self.optimizer.zero_grad(set_to_none=True)
                 
-                # Get target distances
-                dist_targets = bbox2dist(anchor_points_pos, target_bboxes_pos, self.reg_max-1)  # Shape: (num_pos, 4)
+                # Check batch validity
+                if batch['bbox'].numel() == 0:
+                    print(f"\nSkipping empty batch {batch_idx}")
+                    continue
                 
-                # Apply DFLLoss to each distance component
-                dfl_loss = 0.0
-                for c in range(4):
-                    dfl_loss += self.dfl_loss(
-                        dist_pred_pos[:, c * self.reg_max:(c + 1) * self.reg_max],
-                        dist_targets[:, c]
+                # Print batch stats
+                print(f"\nBatch {batch_idx} content:")
+                print(f"Images: {batch['image'].shape}")
+                print(f"Boxes: {batch['bbox'].shape}")
+                print(f"Categories: {batch['category'].shape}")
+                print(f"Valid boxes: {(batch['bbox'].sum(dim=-1) != 0).sum()}")
+                
+                # Move data to device
+                images = batch['image'].to(self.device, non_blocking=True)
+                target_bboxes = batch['bbox'].to(self.device, non_blocking=True)
+                target_categories = batch['category'].to(self.device, non_blocking=True)
+                
+                # Memory check after data loading
+                print(f"\n[Batch {batch_idx}] After data loading:")
+                print(f"Allocated: {torch.cuda.memory_allocated()/1e6:.2f} MB")
+                print(f"Reserved: {torch.cuda.memory_reserved()/1e6:.2f} MB")
+                
+                # Forward pass with autocast
+                with torch.cuda.amp.autocast():
+                    # Get predictions
+                    preds = self.model(images)
+                    pred = preds[0] if isinstance(preds, (list, tuple)) else preds
+                    
+                    # Validate predictions
+                    if pred is None or pred.numel() == 0:
+                        print(f"Empty predictions in batch {batch_idx}")
+                        continue
+                        
+                    # Check prediction stats
+                    print(f"\nPrediction stats:")
+                    print(f"Shape: {pred.shape}")
+                    print(f"Mean: {pred.mean().item():.4f}")
+                    print(f"Std: {pred.std().item():.4f}")
+                    print(f"Requires grad: {pred.requires_grad}")
+                    
+                    # Prepare predictions for loss
+                    B, C, D, H, W = pred.shape
+                    num_anchors = H * W
+                    pred = pred.permute(0, 3, 4, 1, 2).reshape(B, num_anchors, -1)
+                    reg_max = 16
+                    pred_dist = pred[..., :reg_max * 4]
+                    
+                    # Generate anchors
+                    anchor_points = self.loss_fn.make_anchors(H, W, pred.device)
+                    pred_bboxes = self.loss_fn.bbox_decode(pred_dist, anchor_points)
+                    
+                    # Prepare targets
+                    fg_mask = torch.zeros(B, num_anchors, dtype=torch.bool, device=self.device)
+                    target_scores = torch.zeros(B, num_anchors, device=self.device)
+                    
+                    # Find valid targets
+                    valid_targets = 0
+                    for b in range(B):
+                        valid_mask = target_categories[b] > 0
+                        num_valid = valid_mask.sum().item()
+                        valid_targets += num_valid
+                        if num_valid > 0:
+                            fg_mask[b, :num_valid] = True
+                            target_scores[b, :num_valid] = 1.0
+                    
+                    print(f"Valid targets: {valid_targets}")
+                    
+                    if valid_targets == 0:
+                        print(f"No valid targets in batch {batch_idx}")
+                        continue
+                    
+                    target_scores_sum = target_scores.sum().clamp(min=1)
+                    
+                    # Compute losses
+                    box_loss, dfl_loss, quat_loss = self.loss_fn(
+                        pred_dist=pred_dist,
+                        pred_bboxes=pred_bboxes,
+                        anchor_points=anchor_points,
+                        target_bboxes=target_bboxes,
+                        target_scores=target_scores,
+                        target_scores_sum=target_scores_sum,
+                        fg_mask=fg_mask
                     )
-                dfl_loss = dfl_loss / 4.0  # Average over the four components
-            
-            # Calculate IoU loss
-            matched_pred_boxes = pred_bboxes[fg_mask]
-            matched_target_boxes = target_bboxes[fg_mask]
-            iou = bbox_iou(matched_pred_boxes, matched_target_boxes, xywh=True)
-            box_loss = ((1.0 - iou) * target_scores[fg_mask]).sum() / target_scores_sum
-            
-            # Calculate quaternion losses if enabled
-            if self.use_quat and pred_quat is not None and target_quat is not None:
-                matched_pred_quat = pred_quat[fg_mask]
-                matched_target_quat = target_quat[fg_mask]
+                    
+                    # Validate losses
+                    total_loss = box_loss + dfl_loss
+                    if quat_loss is not None:
+                        total_loss += quat_loss
+                    
+                    if not total_loss.requires_grad:
+                        print(f"Warning: total_loss lost gradients")
+                        print(f"box_loss requires_grad: {box_loss.requires_grad}")
+                        print(f"dfl_loss requires_grad: {dfl_loss.requires_grad}")
+                        if quat_loss is not None:
+                            print(f"quat_loss requires_grad: {quat_loss.requires_grad}")
+                        raise ValueError("Loss doesn't require gradients")
                 
-                quat_reg = self.quat_reg_loss(matched_pred_quat)
-                geo_consistency = self.geo_consistency_loss(matched_pred_boxes, matched_pred_quat)
-                orientation_smoothness = self.orientation_smoothness_loss(
-                    matched_pred_quat,
-                    self.get_neighbor_quat(matched_pred_quat)
-                )
-                quat_loss = quat_reg + geo_consistency + orientation_smoothness
+                # Backward pass
+                self.scaler.scale(total_loss).backward()
+                
+                # Gradient clipping
+                if self.grad_clip_val > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
+                
+                # Optimize
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                
+                # Update metrics
+                with torch.no_grad():
+                    epoch_metrics['total_loss'] += total_loss.item()
+                    epoch_metrics['box_loss'] += box_loss.item()
+                    epoch_metrics['dfl_loss'] += dfl_loss.item()
+                    if quat_loss is not None:
+                        epoch_metrics['quat_loss'] += quat_loss.item()
+                
+                # Update progress bar
+                progress_bar.set_postfix({
+                    'loss': f"{total_loss.item():.4f}",
+                    'box': f"{box_loss.item():.4f}",
+                    'dfl': f"{dfl_loss.item():.4f}",
+                    'quat': f"{quat_loss.item() if quat_loss is not None else 0.0:.4f}"
+                })
+                
+                # Memory check after optimization
+                print(f"\n[Batch {batch_idx}] After optimizer step:")
+                print(f"Allocated: {torch.cuda.memory_allocated()/1e6:.2f} MB")
+                print(f"Reserved: {torch.cuda.memory_reserved()/1e6:.2f} MB")
+                
+            except RuntimeError as e:
+                print(f"\nError in batch {batch_idx}:")
+                print(f"Error type: {type(e)}")
+                print(f"Error message: {str(e)}")
+                print("\nLast tensor states:")
+                print(f"pred_dist shape: {pred_dist.shape}")
+                print(f"pred_bboxes shape: {pred_bboxes.shape}")
+                print(f"box_loss: {box_loss}")
+                print(f"dfl_loss: {dfl_loss}")
+                print(f"total_loss: {total_loss}")
+                print("\nCUDA Memory Status:")
+                print(f"Allocated: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+                print(f"Reserved: {torch.cuda.memory_reserved()/1e9:.2f} GB")
+                raise e
+            
+            finally:
+                # Cleanup
+                torch.cuda.empty_cache()
 
-        return box_loss, dfl_loss, quat_loss
+        # Calculate epoch metrics
+        num_batches = len(self.train_dataloader)
+        epoch_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
+        
+        return epoch_metrics
 
     def get_neighbor_quat(self, pred_quat):
         """Get neighboring quaternions for smoothness calculation."""

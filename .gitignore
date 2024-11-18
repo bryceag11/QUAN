@@ -1,6 +1,10 @@
 # .gitignore
-data
+data/
 *.pyc
 __pycache__/
 .ipynb_checkpoints/
 *.log
+venv/
+Lib/
+Include/
+Scripts/
