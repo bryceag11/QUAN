@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+# quaternion/conv.py
 
 import torch
 import torch.nn as nn
@@ -9,14 +9,16 @@ import math
 
 __all__ = ['QConv', 'QConv1D', 'QConv2D',
            'QConv3D', 'QDense', 'QInit']
-
 class QConv(nn.Module):
+    """
+    Base Quaternion Convolution class.
+    """
     def __init__(self, 
                  rank: int,
                  in_channels: int,
                  out_channels: int,
                  kernel_size: Union[int, Tuple[int, ...]],
-                 strides: Union[int, Tuple[int, ...]] = 1,
+                 stride: Union[int, Tuple[int, ...]] = 1,
                  padding: Union[str, int, Tuple[int, ...]] = 0,
                  dilation: Union[int, Tuple[int, ...]] = 1,
                  groups: int = 1,
@@ -26,133 +28,200 @@ class QConv(nn.Module):
                  dtype=None) -> None:
         super(QConv, self).__init__()
         
+        assert rank in [1, 2, 3], "rank must be 1, 2, or 3"
+        
+        # Special handling for first layer
+        self.is_first_layer = (in_channels == 4)
+        if not self.is_first_layer:
+            assert in_channels % 4 == 0, "in_channels must be multiple of 4 (except for first layer)"
+            
+        assert out_channels % 4 == 0, "out_channels must be multiple of 4"
+        
         self.rank = rank
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size = self._normalize_tuple(kernel_size, rank, 'kernel_size')
-        self.strides = self._normalize_tuple(strides, rank, 'strides')
-        self.dilation = self._normalize_tuple(dilation, rank, 'dilation')
-        self.padding = padding
         self.groups = groups
-        pad_mode_map = {
-            'zeros': 'constant',
-            'reflect': 'reflect',
-            'replicate': 'replicate',
-            'circular': 'circular'
-        }
-        self.padding_mode = pad_mode_map.get(padding_mode, 'constant')
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,) * rank
         
-        # Create weight parameters - ensure proper shape for convolution
+        # Define the underlying real-valued convolution for each quaternion component
         if rank == 1:
-            kernel_shape = (out_channels, in_channels // groups, self.kernel_size[0])
+            Conv = nn.Conv1d
         elif rank == 2:
-            kernel_shape = (out_channels, in_channels // groups, *self.kernel_size)
-        else:  # rank == 3
-            kernel_shape = (out_channels, in_channels // groups, *self.kernel_size)
-
-        # Initialize phase weights
-        phase = torch.empty(kernel_shape, device=device, dtype=dtype)
-        self.phase = nn.Parameter(torch.nn.init.uniform_(phase, -math.pi, math.pi))
-
-        # Initialize modulus weights
-        fan_in = in_channels * np.prod(self.kernel_size)
-        modulus = torch.empty(kernel_shape, device=device, dtype=dtype)
-        bound = 1 / math.sqrt(fan_in)
-        self.modulus = nn.Parameter(torch.nn.init.uniform_(modulus, -bound, bound))
-
-        # Initialize bias
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(out_channels, device=device, dtype=dtype))
+            Conv = nn.Conv2d
         else:
-            self.register_parameter('bias', None)
+            Conv = nn.Conv3d
+            
+        # For first layer, use in_channels=1, for others use in_channels//4
+        actual_in_channels = 1 if self.is_first_layer else in_channels // 4
+        out_channels_quat = out_channels // 4
+        
+        self.conv_rr = Conv(
+            actual_in_channels,
+            out_channels_quat,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+        
+        self.conv_ri = Conv(
+            actual_in_channels,
+            out_channels_quat,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+        
+        self.conv_rj = Conv(
+            actual_in_channels,
+            out_channels_quat,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+        
+        self.conv_rk = Conv(
+            actual_in_channels,
+            out_channels_quat,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=False,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
 
-    def _normalize_tuple(self, value, rank, name):
-        if isinstance(value, int):
-            return (value,) * rank
-        else:
-            return tuple(value)
+    def _initialize_weights(self):
+        # Calculate fan_in for initialization
+        kernel_prod = np.prod(self.kernel_size)
+        fan_in = (self.in_channels // 4 if not self.is_first_layer else 1) * kernel_prod
+        
+        # Initialize conv_rr
+        nn.init.kaiming_uniform_(self.conv_rr.weight, a=math.sqrt(5))
+        if self.conv_rr.bias is not None:
+            bound = 1 / math.sqrt(fan_in)
+            nn.init.uniform_(self.conv_rr.bias, -bound, bound)
+        
+        # Initialize other convolutions
+        for conv in [self.conv_ri, self.conv_rj, self.conv_rk]:
+            nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5))
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """Memory-efficient forward pass."""
-        if input is None:
-            raise ValueError("Input tensor cannot be None")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Base forward pass implementation."""
+        if self.is_first_layer and x.dim() == 4:  # First layer
+            B, Q, H, W = x.shape
+            assert Q == 4, "First layer input must have 4 quaternion components"
             
-        padding = self._get_padding(input.shape) if isinstance(self.padding, str) else self.padding
-        
-        # Get convolution function based on rank
-        conv_fn = {1: F.conv1d, 2: F.conv2d, 3: F.conv3d}[self.rank]
+            # Process each quaternion component separately
+            components = []
+            for i in range(4):
+                comp = x[:, i:i+1]  # Keep dim: [B, 1, H, W]
+                components.append(comp)
+            
+            # Apply convolutions with Hamilton product
+            out_r = self.conv_rr(components[0]) - self.conv_ri(components[1]) - self.conv_rj(components[2]) - self.conv_rk(components[3])
+            out_i = self.conv_rr(components[1]) + self.conv_ri(components[0]) + self.conv_rj(components[3]) - self.conv_rk(components[2])
+            out_j = self.conv_rr(components[2]) - self.conv_ri(components[3]) + self.conv_rj(components[0]) + self.conv_rk(components[1])
+            out_k = self.conv_rr(components[3]) + self.conv_ri(components[2]) - self.conv_rj(components[1]) + self.conv_rk(components[0])
+            
+            # Stack outputs
+            out = torch.stack([out_r, out_i, out_j, out_k], dim=2)  # [B, C_out//4, 4, H, W]
+            
+            return out
+            
+        else:  # Later layers
+            x_r = x[:, :, 0, :, :]  # shape: [B, C_q, H, W]
+            x_i = x[:, :, 1, :, :]
+            x_j = x[:, :, 2, :, :]
+            x_k = x[:, :, 3, :, :]
 
-        # Calculate weights in chunks to save memory
-        chunk_size = min(32, self.out_channels)  # Adjust based on available memory
-        out_chunks = []
-        
-        for i in range(0, self.out_channels, chunk_size):
-            end_idx = min(i + chunk_size, self.out_channels)
-            chunk_slice = slice(i, end_idx)
-            
-            # Calculate quaternion weights for this chunk
-            cos_weights = torch.cos(self.phase[chunk_slice]) * self.modulus[chunk_slice]
-            sin_weights = torch.sin(self.phase[chunk_slice]) * self.modulus[chunk_slice]
-            
-            # Calculate output for this chunk
-            # Real part
-            chunk_real = conv_fn(
-                input=input,
-                weight=cos_weights,
-                bias=None,
-                stride=self.strides,
-                padding=padding,
-                dilation=self.dilation,
-                groups=self.groups
-            )
-            
-            # Imaginary part
-            chunk_imag = conv_fn(
-                input=input,
-                weight=sin_weights,
-                bias=None,
-                stride=self.strides,
-                padding=padding,
-                dilation=self.dilation,
-                groups=self.groups
-            )
-            
-            # Combine results for this chunk
-            out_chunk = chunk_real - chunk_imag
-            out_chunks.append(out_chunk)
-            
-            # Clear intermediates
-            del chunk_real, chunk_imag, cos_weights, sin_weights
-        
-        # Concatenate all chunks along channel dimension
-        output = torch.cat(out_chunks, dim=1) if len(out_chunks) > 1 else out_chunks[0]
-        
-        # Add bias if present
-        if self.bias is not None:
-            output = output + self.bias.view(1, -1, *([1] * (output.dim() - 2)))
-        
-        return output
-        
+            # Apply quaternion convolutions
+            r_r = self.conv_rr(x_r) # [B, C_out/4, H, W]
+            r_i = self.conv_ri(x_r)
+            r_j = self.conv_rj(x_r)
+            r_k = self.conv_rk(x_r)
 
-    def _get_padding(self, input_size):
-        if isinstance(self.padding, str) and self.padding.lower() == 'same':
-            pad = []
-            for i in range(self.rank):
-                input_dim = input_size[-(i + 2)]
-                kernel_dim = self.kernel_size[-(i + 1)]
-                stride = self.strides[-(i + 1)]
-                dilation = self.dilation[-(i + 1)]
-                
-                out_dim = (input_dim + stride - 1) // stride
-                pad_needed = max(0, (out_dim - 1) * stride + 
-                               ((kernel_dim - 1) * dilation + 1) - input_dim)
-                pad_start = pad_needed // 2
-                pad_end = pad_needed - pad_start
-                pad = [pad_start, pad_end] + pad
-            return tuple(pad)
-        return self.padding
+            i_r = self.conv_rr(x_i)
+            i_i = self.conv_ri(x_i)
+            i_j = self.conv_rj(x_i)
+            i_k = self.conv_rk(x_i)
 
-class QConv2d(QConv):
+            j_r = self.conv_rr(x_j)
+            j_i = self.conv_ri(x_j)
+            j_j = self.conv_rj(x_j)
+            j_k = self.conv_rk(x_j)
+
+            k_r = self.conv_rr(x_k)
+            k_i = self.conv_ri(x_k)
+            k_j = self.conv_rj(x_k)
+            k_k = self.conv_rk(x_k)
+
+            # Hamilton product
+            out_r = r_r - i_i - j_j - k_k
+            out_i = r_i + i_r + j_k - k_j
+            out_j = r_j - i_k + j_r + k_i
+            out_k = r_k + i_j - j_i + k_r
+
+            # Stack back into quaternion format
+            # Result shape: [B, C_out/4, 4, H, W]
+            out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
+            return out
+
+class QConv1D(QConv):
+    """1D Quaternion Convolution layer."""
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int]],
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[str, int, Tuple[int]] = 0,
+                 dilation: Union[int, Tuple[int]] = 1,
+                 groups: int = 1,
+                 bias: bool = True,
+                 padding_mode: str = 'zeros',
+                 device=None,
+                 dtype=None) -> None:
+        super(QConv1D, self).__init__(
+            rank=1,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+
+
+
+class QConv2D(QConv):
     """2D Quaternion Convolution layer."""
     def __init__(self,
                  in_channels: int,
@@ -167,79 +236,26 @@ class QConv2d(QConv):
                  device=None,
                  dtype=None) -> None:
         super().__init__(
-            rank=2,
+            rank=2,  # Fixed for 2D convolution
             in_channels=in_channels,
             out_channels=out_channels,
             kernel_size=kernel_size,
-            strides=stride,
+            stride=stride,
             padding=padding,
             dilation=dilation,
             groups=groups,
             bias=bias,
             padding_mode=padding_mode,
             device=device,
-            dtype=dtype)
+            dtype=dtype
+        )
 
 
-class QConv1d(QConv):
-    """1D Quaternion Convolution layer."""
-    def __init__(self,
-                 filters: int,
-                 kernel_size: Union[int, Tuple[int]],
-                 stride: int = 1,
-                 padding: Union[str, int] = 0,
-                 dilation: int = 1,
-                 groups: int = 1,
-                 bias: bool = True,
-                 padding_mode: str = 'zeros',
-                 device=None,
-                 dtype=None) -> None:
-        super(QConv1d, self).__init__(
-            rank=1,
-            filters=filters,
-            kernel_size=kernel_size,
-            strides=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-            padding_mode=padding_mode,
-            device=device,
-            dtype=dtype)
-
-# class QConv2d(QConv):
-#     """2D Quaternion Convolution layer."""
-#     def __init__(self,
-#                  in_channels: int,
-#                  out_channels: int,
-#                  kernel_size: Union[int, Tuple[int, int]],
-#                  stride: Union[int, Tuple[int, int]] = 1,
-#                  padding: Union[str, int, Tuple[int, int]] = 0,
-#                  dilation: Union[int, Tuple[int, int]] = 1,
-#                  groups: int = 1,
-#                  bias: bool = True,
-#                  padding_mode: str = 'zeros',
-#                  device=None,
-#                  dtype=None) -> None:
-#         super(QConv2d, self).__init__(
-#             rank=2,
-#             in_channels=in_channels,
-#             out_channels=out_channels,
-#             kernel_size=kernel_size,
-#             strides=stride,
-#             padding=padding,
-#             dilation=dilation,
-#             groups=groups,
-#             bias=bias,
-#             padding_mode=padding_mode,
-#             device=device,
-#             dtype=dtype)
-
-
-class QConv3d(QConv):
+class QConv3D(QConv):
     """3D Quaternion Convolution layer."""
     def __init__(self,
-                 filters: int,
+                 in_channels: int,
+                 out_channels: int,
                  kernel_size: Union[int, Tuple[int, int, int]],
                  stride: Union[int, Tuple[int, int, int]] = 1,
                  padding: Union[str, int, Tuple[int, int, int]] = 0,
@@ -249,90 +265,17 @@ class QConv3d(QConv):
                  padding_mode: str = 'zeros',
                  device=None,
                  dtype=None) -> None:
-        super(QConv3d, self).__init__(
+        super(QConv3D, self).__init__(
             rank=3,
-            filters=filters,
+            in_channels=in_channels,
+            out_channels=out_channels,
             kernel_size=kernel_size,
-            strides=stride,
+            stride=stride,
             padding=padding,
             dilation=dilation,
             groups=groups,
             bias=bias,
             padding_mode=padding_mode,
             device=device,
-            dtype=dtype)
-        
-class QDense(nn.Module):
-    """
-    Quaternion Dense (fully connected) layer.
-    """
-    def __init__(self,
-                 in_features: int,
-                 units: int,
-                 bias: bool = True,
-                 device=None,
-                 dtype=None) -> None:
-        """
-        Initialize quaternion dense layer.
-        
-        Args:
-            in_features: Number of input features (should be divisible by 3)
-            units: Number of output units (will be multiplied by 3 internally)
-            bias: Whether to include bias
-        """
-        factory_kwargs = {'device': device, 'dtype': dtype}
-        super(QDense, self).__init__()
-        
-        assert in_features % 3 == 0, "Input features must be divisible by 3"
-        self.in_features = in_features // 3
-        self.units = units
-
-        # Initialize phase kernel using normal distribution
-        kernel_shape = (self.in_features, self.units)
-        phase = torch.empty(kernel_shape, **factory_kwargs)
-        self.phase_kernel = nn.Parameter(torch.nn.init.normal_(phase, 0, np.pi/2))
-
-        # Initialize modulus kernel using normal distribution
-        fan_in = self.in_features
-        s = np.sqrt(1. / fan_in)
-        modulus = torch.empty(kernel_shape, **factory_kwargs)
-        self.modulus_kernel = nn.Parameter(torch.nn.init.normal_(modulus, 0, s))
-
-        if bias:
-            self.bias = nn.Parameter(torch.zeros(3 * units, **factory_kwargs))
-        else:
-            self.register_parameter('bias', None)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass implementing quaternion matrix multiplication.
-        """
-        # Calculate quaternion components
-        f_phase1 = torch.cos(self.phase_kernel)
-        f_phase2 = torch.sin(self.phase_kernel) * (3**0.5/3)
-
-        # Calculate filter components
-        f1 = (torch.pow(f_phase1, 2) - torch.pow(f_phase2, 2)) * self.modulus_kernel
-        f2 = (2 * (torch.pow(f_phase2, 2) - f_phase2 * f_phase1)) * self.modulus_kernel
-        f3 = (2 * (torch.pow(f_phase2, 2) + f_phase2 * f_phase1)) * self.modulus_kernel
-        f4 = (2 * (torch.pow(f_phase2, 2) + f_phase2 * f_phase1)) * self.modulus_kernel
-        f5 = (torch.pow(f_phase1, 2) - torch.pow(f_phase2, 2)) * self.modulus_kernel
-        f6 = (2 * (torch.pow(f_phase2, 2) - f_phase2 * f_phase1)) * self.modulus_kernel
-        f7 = (2 * (torch.pow(f_phase2, 2) - f_phase2 * f_phase1)) * self.modulus_kernel
-        f8 = (2 * (torch.pow(f_phase2, 2) + f_phase2 * f_phase1)) * self.modulus_kernel
-        f9 = (torch.pow(f_phase1, 2) - torch.pow(f_phase2, 2)) * self.modulus_kernel
-
-        # Construct transformation matrix
-        matrix1 = torch.cat([f1, f2, f3], dim=1)
-        matrix2 = torch.cat([f4, f5, f6], dim=1)
-        matrix3 = torch.cat([f7, f8, f9], dim=1)
-        matrix = torch.cat([matrix1, matrix2, matrix3], dim=0)
-
-        # Apply transformation
-        output = F.linear(input, matrix.t(), self.bias)
-        return output
-
-    def extra_repr(self) -> str:
-        """Return a string representation of layer parameters."""
-        return f'in_features={self.in_features * 3}, out_features={self.units * 3}, bias={self.bias is not None}'
-    
+            dtype=dtype
+        )

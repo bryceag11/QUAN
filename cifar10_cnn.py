@@ -15,7 +15,7 @@ from pathlib import Path
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from quaternion_layers.conv import QConv2d
+from quaternion_layers.conv import QConv2D
 from quaternion_layers.dense import QDense
 
 # Configuration
@@ -115,9 +115,9 @@ class QuaternionCIFAR10(nn.Module):
         # PREVIOUSLY WORKING CODE
         # First block
         self.block1 = nn.Sequential(
-            QConv2d(in_channels=3, out_channels=32, kernel_size=3, padding='same'),
+            QConv2D(in_channels=3, out_channels=32, kernel_size=3, padding='same'),
             nn.ReLU(),
-            QConv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1),
+            QConv2D(in_channels=32, out_channels=32, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Dropout(0.25)
@@ -125,9 +125,9 @@ class QuaternionCIFAR10(nn.Module):
         
         # Second block
         self.block2 = nn.Sequential(
-            QConv2d(in_channels=32, out_channels=64, kernel_size=3, padding='same'),
+            QConv2D(in_channels=32, out_channels=64, kernel_size=3, padding='same'),
             nn.ReLU(),
-            QConv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
+            QConv2D(in_channels=64, out_channels=64, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Dropout(0.25)

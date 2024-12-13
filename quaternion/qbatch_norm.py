@@ -104,18 +104,22 @@ class IQBN(nn.Module):
         Forward pass for IQBN.
         
         Args:
-            x (torch.Tensor): Input tensor of shape [B*Q, C, H, W]
-                             where B is batch size, Q is quaternion dimension
+            x (torch.Tensor): Input tensor of shape [B, C, Q, H, W]
+                            where B is batch size, Q is quaternion dimension
         
         Returns:
             torch.Tensor: Normalized tensor of the same shape
         """
+        # Save original shape
+        B, C, Q, H, W = x.shape
+        
+        # Reshape to [B*Q, C, H, W]
+        x = x.transpose(1, 2).reshape(B*Q, C, H, W)
+        
         if self.training:
-            # Compute stats over batch*quaternion and spatial dimensions
             mean = x.mean(dim=(0, 2, 3))  # [C]
             var = x.var(dim=(0, 2, 3), unbiased=False)  # [C]
             
-            # Update running stats
             self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
             self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
         else:
@@ -124,6 +128,7 @@ class IQBN(nn.Module):
         
         # Normalize
         x_norm = (x - mean[None, :, None, None]) / torch.sqrt(var[None, :, None, None] + self.eps)
+        x_norm = self.gamma[None, :, None, None] * x_norm + self.beta[None, :, None, None]
         
-        # Apply affine transform
-        return self.gamma[None, :, None, None] * x_norm + self.beta[None, :, None, None]
+        # Reshape back to [B, C, Q, H, W]
+        return x_norm.reshape(B, Q, C, H, W).transpose(1, 2)

@@ -2,9 +2,9 @@
 
 import torch.nn as nn
 import yaml
-from quaternion.conv import QConv, QConv2d
+from quaternion.conv import QConv, QConv2D
 from quaternion.init import QInit
-from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape
+from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape, QAdaptiveFeatureExtraction, QDualAttention, QEnhancedDetectHead, QAdaptiveFusion, QuaternionUpsample
 from .neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN
 from .heads.qdet_head import QDetectHead, QOBBHead
 import torch 
@@ -31,7 +31,7 @@ def initialize_weights(layer):
             bound = 1 / math.sqrt(fan_in)
             torch.nn.init.uniform_(layer.bias, -bound, bound)
     else:
-        # Skip weight initialization for QConv and QConv2d layers
+        # Skip weight initialization for QConv and QConv2D layers
         pass
 
 def load_model_from_yaml(config_path):
@@ -56,7 +56,7 @@ def load_model_from_yaml(config_path):
     module_dict = {
         'QConv': QConv,
         'Reshape': Reshape,
-        'QConv2d': QConv2d,
+        'QConv2D': QConv2D,
         'C3k2': C3k2,
         'PSABlock': PSABlock,
         'SPPF': SPPF,
@@ -65,6 +65,11 @@ def load_model_from_yaml(config_path):
         'QuaternionConcat': QuaternionConcat,
         'QOBBHead': QOBBHead,
         'QDetectHead': QDetectHead,
+        'QAdaptiveFeatureExtraction': QAdaptiveFeatureExtraction,
+        'QDualAttention': QDualAttention,
+        'QAdaptiveFusion': QAdaptiveFusion,
+        'QEnhancedDetectHead': QEnhancedDetectHead,
+        'QuaternionUpsample': QuaternionUpsample
         # Add other layers as needed
     }
     
@@ -73,9 +78,11 @@ def load_model_from_yaml(config_path):
     
     # Build head
     head = build_from_cfg(head_cfg, module_dict)
-    
+    print("\n=== Head Layers ===")
+    for idx, layer in enumerate(head):
+        print(f"Layer {idx}: {layer.__class__.__name__}")
     # Combine backbone and head
-    model = nn.Sequential(backbone, head)
+    model = CustomModel(backbone, head)
     
     return model, nc
 
@@ -88,53 +95,97 @@ def build_from_cfg(cfg, module_dict):
         module_dict (dict): Mapping from layer names to their implementations.
 
     Returns:
-        nn.Sequential: The constructed model layers.
+        nn.ModuleList: The constructed model layers.
     """
     layers = []
     for idx, layer_cfg in enumerate(cfg):
         if isinstance(layer_cfg, list):
-            # Unpack layer configuration
-            from_idx, num_repeats, module_name, module_args = layer_cfg
-
-            # Process module arguments
-            if isinstance(module_args, dict):
-                args = module_args
-            elif isinstance(module_args, list):
-                # Convert list of key=value strings to dict
-                args = {}
-                for arg in module_args:
-                    if isinstance(arg, str) and '=' in arg:
-                        key, value = arg.split('=')
-                        key = key.strip()
-                        value = value.strip()
-                        # Convert value to appropriate type
-                        if value.lower() == 'true':
-                            value = True
-                        elif value.lower() == 'false':
-                            value = False
-                        else:
-                            try:
-                                value = int(value)
-                            except ValueError:
-                                try:
-                                    value = float(value)
-                                except ValueError:
-                                    pass  # Keep as string
-                        args[key] = value
+            # Handle different layer config formats
+            if isinstance(layer_cfg[0], list):
+                # Format: [[layer_indices], repeats, module_name, args]
+                from_layers = layer_cfg[0]
+                num_repeats = layer_cfg[1]
+                module_name = layer_cfg[2]
+                module_args = layer_cfg[3] if len(layer_cfg) > 3 else {}
             else:
-                args = {}
+                # Format: [from_layer, repeats, module_name, args]
+                from_layers = [layer_cfg[0]]
+                num_repeats = layer_cfg[1]
+                module_name = layer_cfg[2]
+                module_args = layer_cfg[3] if len(layer_cfg) > 3 else {}
 
+            # Get module class
             module_class = module_dict.get(module_name)
             if module_class is None:
                 raise ValueError(f"Module '{module_name}' not found in module_dict.")
 
-            # Instantiate the module
+            # Process arguments
+            if isinstance(module_args, dict):
+                args = module_args
+            else:
+                args = {}
+
+            # Create module instance
             for _ in range(num_repeats):
                 module_instance = module_class(**args)
+                # Store from_layers information for concatenation layers
+                if isinstance(module_instance, QuaternionConcat):
+                    module_instance.from_layers = from_layers
                 initialize_weights(module_instance)
                 layers.append(module_instance)
-                # print(f"Added layer {idx}: {module_name} with args {args}")
-        else:
-            # Handle other configurations if necessary
-            pass
-    return nn.Sequential(*layers)
+
+    return nn.ModuleList(layers)
+
+
+class CustomModel(nn.Module):
+    def __init__(self, backbone: nn.ModuleList, head: nn.ModuleList):
+        super().__init__()
+        self.backbone = backbone
+        self.head = head
+        
+    def forward(self, x):
+        feature_maps = []
+        detect_input_features = []
+        first_conv = second_conv = final_c3k2 = None
+        
+        # Process backbone
+        out = x
+        for layer in self.backbone:
+            out = layer(out)
+            feature_maps.append(out)
+            
+        # Process head
+        for layer in self.head:
+            if isinstance(layer, (QDetectHead, QOBBHead)):
+                if first_conv is None or second_conv is None or final_c3k2 is None:
+                    raise ValueError("Missing required features for detection head")
+                detect_inputs = [first_conv, second_conv, final_c3k2]
+
+                return layer(detect_inputs)  # Returns predictions and anchor points
+            
+            # Process current layer
+            if isinstance(layer, QuaternionConcat):
+                if hasattr(layer, 'from_layers'):
+                    input_features = []
+                    for ref in layer.from_layers:
+                        if isinstance(ref, list):
+                            for r in ref:
+                                input_features.append(feature_maps[r] if r != -1 else out)
+                        else:
+                            input_features.append(feature_maps[ref] if ref != -1 else out)
+                    out = layer(input_features)
+                else:
+                    out = layer([out])
+            else:
+                out = layer(out)
+                if isinstance(layer, QConv2D):
+                    if first_conv is None:
+                        first_conv = out
+                    elif second_conv is None:
+                        second_conv = out
+                elif isinstance(layer, C3k2) and second_conv is not None:
+                    final_c3k2 = out
+            
+            feature_maps.append(out)
+        
+        return out

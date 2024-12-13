@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Union
-from quaternion.conv import QConv, QConv1d, QConv2d, QConv3d
+from quaternion.conv import QConv, QConv1D, QConv2D, QConv3D
 from quaternion.qactivation import QHardTanh, QLeakyReLU, QuaternionActivation, QReLU, QPReLU, QREReLU, QSigmoid, QTanh
 from quaternion.qbatch_norm import QBN, IQBN, VQBN
 import math 
@@ -12,87 +12,72 @@ import torch
 import torch.nn as nn
 
 
+
 class QuaternionConcat(nn.Module):
     def __init__(self, dim=1, reduce=True, target_channels=None):
-        """
-        Initialize the QuaternionConcat module.
-
-        Args:
-            dim (int): The dimension along which to concatenate.
-            reduce (bool): Whether to reduce the number of channels after concatenation.
-            target_channels (int, optional): The desired number of channels after reduction.
-        """
-        super(QuaternionConcat, self).__init__()
+        super().__init__()
         self.dim = dim
         self.reduce = reduce
         self.target_channels = target_channels
-
-        if self.reduce:
-            if self.target_channels is None:
-                raise ValueError("target_channels must be specified when reduce=True")
-            # 1x1 convolution to reduce channels, initialized later
-            self.reduction_conv = None  # To be set dynamically in forward
-            self.bn = None
-            self.relu = nn.ReLU(inplace=True)
+        
+        if self.reduce and self.target_channels is None:
+            raise ValueError("`target_channels` must be specified when `reduce=True`.")
+        
+        self.reduction_conv = None
+        self.bn = None
+        self.relu = QReLU()
 
     def forward(self, x: list) -> torch.Tensor:
-        """
-        Forward pass for QuaternionConcat.
+        if isinstance(x, torch.Tensor):
+            x = [x]
+            
 
-        Args:
-            x (list): List of tensors to concatenate.
+        # Validate inputs
+        for i, t in enumerate(x):
+            if t.dim() != 5:
+                raise ValueError(f"Tensor {i} has shape {t.shape}. Expected 5 dimensions [B, C, 4, H, W].")
+            if t.shape[2] != 4:
+                raise ValueError(f"Tensor {i} has quaternion dimension {t.shape[2]}, expected 4.")
 
-        Returns:
-            torch.Tensor: Concatenated (and possibly reduced) tensor.
-        """
-        # Debug shapes
-        # print("\nQuaternionConcat Input Shapes:")
-        # for i, t in enumerate(x):
-        #     print(f"Input tensor {i}: {t.shape}")
-
-        # Ensure all tensors have batch dimension
+        # Get largest spatial dimensions
+        max_h = max(t.shape[-2] for t in x)
+        max_w = max(t.shape[-1] for t in x)
+        
+        # Upsample smaller tensors to match largest spatial dimensions
         processed = []
-        batch_size = None
         for t in x:
-            if t.dim() == 3:
-                t = t.unsqueeze(0)  # [1, C, H, W]
-            elif t.dim() != 4:
-                raise ValueError(f"Unexpected tensor shape: {t.shape}")
+            if t.shape[-2] != max_h or t.shape[-1] != max_w:
+                # Preserve the quaternion dimension during interpolation
+                B, C, Q, H, W = t.shape
+                t_reshaped = t.permute(0, 2, 1, 3, 4).reshape(B*Q, C, H, W)
+                t_upsampled = F.interpolate(t_reshaped, size=(max_h, max_w), mode='nearest')
+                t = t_upsampled.reshape(B, Q, C, max_h, max_w).permute(0, 2, 1, 3, 4)
             processed.append(t)
-            if batch_size is None:
-                batch_size = t.shape[0]
-            elif batch_size != t.shape[0]:
-                raise ValueError("All tensors must have the same batch size")
 
-        # Ensure spatial sizes match by cropping to the smallest height and width
-        h_min = min(t.shape[2] for t in processed)
-        w_min = min(t.shape[3] for t in processed)
-        # Crop tensors to min height and width
-        processed = [t[:, :, :h_min, :w_min] for t in processed]
-        # Debug after cropping
-        # for i, t in enumerate(processed):
-        #     print(f"Input tensor {i} after cropping: {t.shape}")
-
-        # Concatenate along the specified dimension
-        out = torch.cat(processed, dim=self.dim)
+        # Concatenate along channel dimension
+        out = torch.cat(processed, dim=1)  # [B, C*len(x), 4, H, W]
 
         if self.reduce:
             if self.reduction_conv is None:
-                in_channels = out.shape[1]
-                self.reduction_conv = nn.Conv2d(
+                # For QConv2D, input_channels should be total channels divided by 4
+                in_channels = out.shape[1] * 4
+                
+                self.reduction_conv = QConv2D(
                     in_channels=in_channels,
                     out_channels=self.target_channels,
                     kernel_size=1,
                     bias=False
                 ).to(out.device)
-                nn.init.kaiming_uniform_(self.reduction_conv.weight, a=math.sqrt(5))
-                self.bn = nn.BatchNorm2d(self.target_channels).to(out.device)
+                
+                # BN works on channels divided by 4 due to quaternion structure
+                self.bn = IQBN(self.target_channels // 4).to(out.device)
+            
+            # Apply reduction
             out = self.reduction_conv(out)
             out = self.bn(out)
             out = self.relu(out)
 
         return out
-    
 
 class QuaternionFPN(nn.Module):
     """Feature Pyramid Network for Quaternion Neural Networks."""
@@ -102,10 +87,10 @@ class QuaternionFPN(nn.Module):
         assert all(c % 4 == 0 for c in in_channels + [out_channels]), "Channels must be multiples of 4."
         
         self.lateral_convs = nn.ModuleList([
-            QConv2d(c, out_channels, kernel_size=1, stride=1, padding=0, bias=False) for c in in_channels
+            QConv2D(c, out_channels, kernel_size=1, stride=1, padding=0, bias=False) for c in in_channels
         ])
         self.output_convs = nn.ModuleList([
-            QConv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False) for _ in in_channels
+            QConv2D(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False) for _ in in_channels
         ])
     
     def forward(self, inputs):
@@ -138,10 +123,10 @@ class QuaternionPAN(nn.Module):
         assert all(c % 4 == 0 for c in in_channels + [out_channels]), "Channels must be multiples of 4."
         
         self.down_convs = nn.ModuleList([
-            QConv2d(c, out_channels, kernel_size=3, stride=2, padding=1, bias=False) for c in in_channels
+            QConv2D(c, out_channels, kernel_size=3, stride=2, padding=1, bias=False) for c in in_channels
         ])
         self.output_convs = nn.ModuleList([
-            QConv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False) for _ in in_channels
+            QConv2D(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False) for _ in in_channels
         ])
     
     def forward(self, inputs):

@@ -1,0 +1,131 @@
+Layer Activation Shapes:
+
+Layer 0 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 1 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 2 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 3 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 4 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 5 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 6 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 7 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 8 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 9 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 10 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 11 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 12 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 13 (SPPF):
+Input shape: torch.Size([2, 128, 4, 14, 19])
+Output shape: torch.Size([2, 128, 4, 14, 19])
+------------------------------
+
+Layer 14 (QuaternionUpsample):
+Input shape: torch.Size([2, 64, 4, 59, 79])
+Output shape: torch.Size([2, 64, 4, 118, 158])
+------------------------------
+
+Layer 15 (QuaternionConcat):
+Input shape: [torch.Size([2, 32, 4, 59, 79]), torch.Size([2, 128, 4, 28, 38])]
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 16 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 17 (QuaternionUpsample):
+Input shape: torch.Size([2, 64, 4, 59, 79])
+Output shape: torch.Size([2, 64, 4, 118, 158])
+------------------------------
+
+Layer 18 (QuaternionConcat):
+Input shape: [torch.Size([2, 32, 4, 59, 79]), torch.Size([2, 128, 4, 28, 38])]
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 19 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 20 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 21 (QuaternionConcat):
+Input shape: [torch.Size([2, 32, 4, 59, 79]), torch.Size([2, 128, 4, 28, 38])]
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 22 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 23 (QConv2D):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 36, 4, 59, 79])
+------------------------------
+
+Layer 24 (QuaternionConcat):
+Input shape: [torch.Size([2, 32, 4, 59, 79]), torch.Size([2, 128, 4, 28, 38])]
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------
+
+Layer 25 (C3k2):
+Input shape: torch.Size([2, 128, 4, 59, 79])
+Output shape: torch.Size([2, 128, 4, 59, 79])
+------------------------------

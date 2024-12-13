@@ -19,39 +19,179 @@ def enforce_quaternion_hemisphere(quat):
     quat[mask] = -quat[mask]
     return quat
 
-class QuaternionLoss(nn.Module):
-    """Custom loss function for quaternion-based object detection."""
-
-    def __init__(self, obj_scale=1.0, cls_scale=1.0, box_scale=1.0, angle_scale=1.0):
-        super(QuaternionLoss, self).__init__()
-        self.obj_scale = obj_scale
-        self.cls_scale = cls_scale
-        self.box_scale = box_scale
-        self.angle_scale = angle_scale
-        self.bce = nn.BCEWithLogitsLoss()
-        self.l1 = nn.L1Loss()
-        self.angle_loss = nn.MSELoss()  # Or another suitable loss for angles/quaternions
-
-    def forward(self, predictions, targets):
-        # Split predictions and targets into respective components
-        pred_boxes, pred_classes, pred_angles = predictions
-        target_boxes, target_classes, target_angles = targets
-
-        # Objectness loss
-        obj_loss = self.bce(pred_classes, target_classes)
-
-        # Bounding box loss
-        box_loss = self.l1(pred_boxes, target_boxes)
-
-        # Orientation loss
-        angle_loss = self.angle_loss(pred_angles, target_angles)
-
-        # Total loss
-        total_loss = (self.obj_scale * obj_loss +
-                      self.cls_scale * box_loss +
-                      self.angle_scale * angle_loss)
+class DetectionLoss(nn.Module):
+    def __init__(self, reg_max=9, nc=80, use_dfl=True):  # Changed reg_max from 16 to 9
+        super().__init__()
+        self.reg_max = reg_max
+        self.nc = nc
+        self.use_dfl = use_dfl
+        self.dfl = DFLoss(reg_max) if use_dfl else nn.Identity()
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.iou_loss = nn.SmoothL1Loss(reduction='none')
+        self.quaternion_loss = QuaternionLoss()
         
-        return total_loss
+    def forward(self, outputs, anchor_points, target_bboxes, target_categories, target_scores_sum):
+        """
+        Args:
+            outputs: List of outputs from QDetectHead, each with shape [B, 36, Q, H, W]
+                    where 36 = 4 * reg_max(9)
+            anchor_points: Dict of anchor points for each level
+            target_bboxes: Shape [B, M, 4]
+            target_categories: Shape [B, M]
+            target_scores_sum: Scalar tensor
+        """
+        total_box_loss = 0
+        total_dfl_loss = 0 
+        total_cls_loss = 0
+        total_quat_loss = 0
+        num_levels = len(outputs)
+
+        print("\nProcessing detection loss:")
+        for i, pred in enumerate(outputs):
+            print(f"Level {i} output shape: {pred.shape}")
+        print(f"Target bboxes shape: {target_bboxes.shape}")
+        print(f"Target categories shape: {target_categories.shape}")
+        
+        for level_idx, pred in enumerate(outputs):
+            # Get dimensions
+            B, C, Q, H, W = pred.shape
+            print(f"\nLevel {level_idx}:")
+            print(f"B={B}, C={C}, Q={Q}, H={H}, W={W}")
+
+            # Split channels - expect C=36 total channels:
+            # - First 36 channels: 4 coordinates * 9 reg_max values = 36 for regression
+            reg_channels = 4 * self.reg_max  # Should be 36
+            
+            # Reshape predictions - preserve batch dim for clarity
+            pred = pred.permute(0, 3, 4, 2, 1)  # [B, H, W, Q, C]
+            pred = pred.reshape(B, H * W, Q, C)  # [B, H*W, Q, C]
+            
+            # Split into regression only since all channels are for regression
+            pred_reg = pred  # [B, H*W, Q, C]
+
+            # Get anchor points for this level
+            level_anchors = anchor_points[level_idx]  # [H*W, 2]
+            
+            if self.use_dfl:
+                # Reshape for DFL - maintain batch dimension
+                pred_dist = pred_reg.reshape(B, H*W, Q, 4, self.reg_max)
+                pred_dist = F.softmax(pred_dist, dim=-1)
+                
+                # Process each batch independently
+                pred_boxes = []
+                for b in range(B):
+                    # [H*W, Q, 4, reg_max] -> [H*W*Q, 4, reg_max]
+                    batch_dist = pred_dist[b].reshape(-1, 4,reg_channels)
+                    # Get distribution-based coordinates
+                    batch_boxes = dist2bbox(
+                        batch_dist.reshape(-1,reg_channels), 
+                        level_anchors.repeat_interleave(Q, dim=0)
+                    )  # [H*W*Q, 4]
+                    pred_boxes.append(batch_boxes)
+                pred_boxes = torch.stack(pred_boxes)  # [B, H*W*Q, 4]
+            else:
+                pred_boxes = dist2bbox(pred_reg.reshape(B*H*W*Q, -1), level_anchors)
+                pred_boxes = pred_boxes.reshape(B, H*W*Q, 4)
+
+            # Compute losses for boxes and quaternions
+            target_boxes_level = target_bboxes.reshape(B, -1, 4)  # [B, M, 4]
+            
+            # Box IoU loss
+            iou = bbox_iou(
+                pred_boxes.reshape(-1, 4),
+                target_boxes_level.reshape(-1, 4),
+                xywh=True
+            )
+            box_loss = -torch.log(iou + 1e-8).mean()
+            
+            if self.use_dfl:
+                # Prepare anchor points 
+                expanded_anchors = level_anchors.unsqueeze(0).expand(B, -1, -1)  # [B, H*W, 2]
+                
+                # Get target distributions
+                target_dist = bbox2dist(
+                    expanded_anchors,  # [B, H*W, 2]
+                    target_boxes_level,  # [B, M, 4] 
+                    reg_max=self.reg_max
+                )  # [B, H*W, 4*reg_max]
+                target_dist = target_dist.reshape(B, H*W, 4, self.reg_max)  # [B, H*W, 4, reg_max]
+                target_dist = target_dist.unsqueeze(2)  # [B, H*W, 1, 4, reg_max]
+                target_dist = target_dist.expand(-1, -1, Q, -1, -1)  # [B, H*W, Q, 4, reg_max]
+
+                # Prepare predictions - reshape to match targets
+                pred_dist = pred_dist.reshape(B, H*W*Q, 4, self.reg_max)
+                
+                # Compute DFL loss
+                flat_pred = pred_dist.reshape(-1, self.reg_max)  # [B*H*W*Q*4, reg_max]
+                flat_target = target_dist.reshape(-1, self.reg_max)  # [B*H*W*Q*4, reg_max]
+
+                dfl_loss = self.dfl(flat_pred, flat_target)
+            else:
+                dfl_loss = torch.tensor(0.0, device=pred_reg.device)
+
+
+            # Quaternion loss
+            quat_loss = self.quaternion_loss(
+                pred_boxes.reshape(B, -1, Q, 4)  # Reshape to expose quaternion dimension
+            )
+
+            # Accumulate losses
+            total_box_loss += box_loss 
+            total_dfl_loss += dfl_loss
+            total_quat_loss += quat_loss
+
+            print(f"Level {level_idx} losses:")
+            print(f"Box loss: {box_loss.item():.4f}")
+            print(f"DFL loss: {dfl_loss.item():.4f}") 
+            print(f"Quat loss: {quat_loss.item():.4f}")
+
+        # Average across levels
+        num_valid_levels = num_levels
+        total_box_loss = total_box_loss / num_valid_levels
+        total_dfl_loss = total_dfl_loss / num_valid_levels
+        total_quat_loss = total_quat_loss / num_valid_levels
+
+        print("\nFinal losses:")
+        print(f"Total box loss: {total_box_loss.item():.4f}")
+        print(f"Total DFL loss: {total_dfl_loss.item():.4f}")
+        print(f"Total quat loss: {total_quat_loss.item():.4f}")
+        
+        return total_box_loss, total_dfl_loss, 0.0, total_quat_loss  # Return 0 for cls_loss since no classification
+
+
+class QuaternionLoss(nn.Module):
+    """
+    Specialized loss for quaternion predictions in object detection.
+    Handles both rotation error and quaternion constraints.
+    """
+    def __init__(self, quaternion_weight=1.0):
+        super().__init__()
+        self.quaternion_weight = quaternion_weight
+        
+    def forward(self, pred_quat, target_quat):
+        """
+        Args:
+            pred_quat: Predicted quaternions [B, N, 4]
+            target_quat: Target quaternions [B, N, 4]
+        """
+        # Normalize quaternions
+        pred_quat = F.normalize(pred_quat, p=2, dim=-1)
+        target_quat = F.normalize(target_quat, p=2, dim=-1)
+        
+        # Double cover handling: q and -q represent same rotation
+        dot_abs = torch.abs(torch.sum(pred_quat * target_quat, dim=-1))
+        dot_abs = torch.clamp(dot_abs, min=0.0, max=1.0)
+        
+        # Angular loss
+        angle_loss = 2 * torch.acos(dot_abs)
+        
+        # Unit norm constraint
+        norm_loss = torch.abs(torch.sum(pred_quat * pred_quat, dim=-1) - 1.0)
+        
+        # Combine losses
+        total_loss = angle_loss.mean() + 0.1 * norm_loss.mean()
+        
+        return self.quaternion_weight * total_loss
 
 # Primarily deals with classification by focusing on positive samples and modulating loss based on prediction confidence
 class VarifocalLoss(nn.Module):
@@ -101,35 +241,31 @@ class FocalLoss(nn.Module):
         return loss.mean(1).sum()
 
 class DFLoss(nn.Module):
-    """Criterion class for computing Distribution Focal Loss (DFL) for bounding boxes."""
-
-    def __init__(self, reg_max=16):
-        """Initialize the DFL module."""
+    def __init__(self, reg_max=9):
         super().__init__()
         self.reg_max = reg_max
 
     def forward(self, pred_dist, target):
-        """
-        Compute the Distribution Focal Loss.
+        # target: [N] with values in [0, reg_max - 1]
+        # pred_dist: [N, reg_max], raw logits (no softmax)
+        
+        target = target.clamp(0, self.reg_max - 1)  # [N]
+        target_float = target.float()
+        
+        left = target  # [N], long
+        right = (left + 1).clamp(max=self.reg_max - 1)  # [N], long
 
-        Args:
-            pred_dist (torch.Tensor): Predicted distance distributions, shape (N, reg_max).
-            target (torch.Tensor): Target distances, shape (N,).
+        weight_right = target_float - left.float()
+        weight_left = 1.0 - weight_right
 
-        Returns:
-            torch.Tensor: Scalar loss value.
-        """
-        target = target.clamp(0, self.reg_max - 1 - 0.01)
-        tl = target.long()
-        tr = tl + 1
-        wl = tr - target
-        wr = 1 - wl
+        # pred_dist should be [N, reg_max] raw logits
+        loss_left = F.cross_entropy(pred_dist, left, reduction='none')
+        loss_right = F.cross_entropy(pred_dist, right, reduction='none')
 
-        loss = (
-            F.cross_entropy(pred_dist, tl, reduction='none') * wl +
-            F.cross_entropy(pred_dist, tr, reduction='none') * wr
-        )
-        return loss.mean()
+        return (weight_left * loss_left + weight_right * loss_right).mean()
+
+
+
 
 
     @staticmethod
@@ -722,305 +858,6 @@ class KeypointLoss(nn.Module):
             loss += angular_loss
 
         return loss
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class DetectionLoss(nn.Module):
-    """
-    Unified Detection Loss for standard and quaternion-based object detection.
-    """
-    def __init__(self, reg_max=16, nc=80, use_quat=False, tal_topk=10):
-        """
-        Initializes DetectionLoss with optional quaternion handling.
-
-        Args:
-            reg_max (int): Maximum value for distance bins.
-            nc (int): Number of classes.
-            use_quat (bool, optional): Flag to include quaternion-based losses. Defaults to False.
-            tal_topk (int, optional): Top-K for Task-Aligned Assigners. Defaults to 10.
-        """
-        super().__init__()
-        self.nc = nc
-        self.reg_max = reg_max
-        self.use_quat = use_quat
-
-        self.use_dfl = self.reg_max > 1
-
-        # Initialize loss components
-        self.bce = nn.BCEWithLogitsLoss(reduction="none")
-        self.bbox_loss = BboxLoss(self.reg_max, self.nc)
-        self.assigner = TaskAlignedAssigner(
-            topk=tal_topk, 
-            num_classes=self.nc, 
-            alpha=0.5, 
-            beta=6.0
-        )
-        self.proj = torch.arange(self.reg_max, dtype=torch.float)
-
-        # Quaternion-related losses
-        if self.use_quat:
-            self.quat_reg_loss = QuaternionRegularizationLoss(lambda_reg=0.1)
-            self.geo_consistency_loss = GeometricConsistencyLoss(lambda_geo=0.5)
-            self.orientation_smoothness_loss = OrientationSmoothnessLoss(lambda_smooth=0.3)
-
-
-    def bbox_decode(self, pred_dist, anchor_points):
-        """Delegate bbox_decode to BboxLoss instance."""
-        return self.bbox_loss.bbox_decode(pred_dist, anchor_points)
-
-    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, 
-                target_scores_sum, fg_mask, pred_quat=None, target_quat=None):
-        """
-        Calculate all components of the detection loss.
-
-        Args:
-            pred_dist (torch.Tensor): Predicted distance distributions, shape (batch_size, num_anchors, 4 * reg_max)
-            pred_bboxes (torch.Tensor): Predicted bounding boxes, shape (batch_size, num_anchors, 4)
-            anchor_points (torch.Tensor): Anchor points, shape (num_anchors, 2)
-            target_bboxes (torch.Tensor): Ground truth bounding boxes, shape (batch_size, num_anchors, 4)
-            target_scores (torch.Tensor): Objectness scores, shape (batch_size, num_anchors)
-            target_scores_sum (torch.Tensor): Sum of objectness scores
-            fg_mask (torch.Tensor): Foreground mask, shape (batch_size, num_anchors)
-            pred_quat (torch.Tensor, optional): Predicted quaternions, shape (batch_size, num_anchors, 4)
-            target_quat (torch.Tensor, optional): Ground truth quaternions, shape (batch_size, num_anchors, 4)
-
-        Returns:
-            tuple: (box_loss, dfl_loss, quat_loss)
-        """
-
-        # Compute Bounding Box Loss
-        box_loss, dfl_loss, quat_loss = self.bbox_loss(
-            pred_dist, 
-            pred_bboxes, 
-            anchor_points, 
-            target_bboxes, 
-            target_scores, 
-            target_scores_sum, 
-            fg_mask
-        )
-
-        # Initialize total loss
-        total_loss = box_loss + dfl_loss
-
-        # Compute Quaternion-related Losses if enabled
-        if self.use_quat and pred_quat is not None and target_quat is not None:
-            quat_reg = self.quat_reg_loss(pred_quat[fg_mask])
-            geo_consistency = self.geo_consistency_loss(pred_bboxes[fg_mask], pred_quat[fg_mask])
-            orientation_smoothness = self.orientation_smoothness_loss(
-                pred_quat[fg_mask],
-                self.get_neighbor_quat(pred_quat[fg_mask])
-            )
-            quat_loss = quat_reg + geo_consistency + orientation_smoothness
-            total_loss += quat_loss
-
-        return box_loss, dfl_loss, quat_loss
-
-    @staticmethod
-    def get_neighbor_quat(pred_quat):
-        """Get neighboring quaternions for smoothness calculation."""
-        # Simple implementation - can be enhanced based on your needs
-        return torch.roll(pred_quat, shifts=1, dims=0)
-
-
-    @staticmethod
-    def make_anchors(h, w, device):
-        """Generate anchor points."""
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(h, device=device, dtype=torch.float32),
-            torch.arange(w, device=device, dtype=torch.float32),
-            indexing='ij'
-        )
-        
-        grid_xy = torch.stack([
-            grid_x.reshape(-1),
-            grid_y.reshape(-1)
-        ], dim=1)
-        
-        # Add offset
-        grid_xy += 0.5
-        
-        return grid_xy
-
-
-    def preprocess(self, targets, batch_size, scale_tensor):
-        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
-        nl, ne = targets.shape
-        if nl == 0:
-            out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
-        else:
-            i = targets[:, 0]  # image index
-            _, counts = i.unique(return_counts=True)
-            counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
-            for j in range(batch_size):
-                matches = i == j
-                n = matches.sum()
-                if n:
-                    out[j, :n] = targets[matches, 1:]
-            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
-        return out
-
-# class v8ClassificationLoss(nn.Module):
-#     """Criterion class for computing training classification losses in quaternion-based models."""
-
-#     def __init__(self, alpha=0.25, gamma=2.0):
-#         """Initialize v8ClassificationLoss with focal loss parameters."""
-#         super().__init__()
-#         self.focal_loss = FocalLoss()
-#         self.alpha = alpha
-#         self.gamma = gamma
-
-#     def __call__(self, preds, batch, pred_quat=None):
-#         """Compute the classification loss between predictions and true labels."""
-#         # Standard classification loss
-#         loss = self.focal_loss(preds, batch["cls"], gamma=self.gamma, alpha=self.alpha)
-
-#         # Optionally, integrate quaternion-based classification adjustments
-#         if pred_quat is not None and batch.get("target_quat") is not None:
-#             # Example: Penalize inconsistency between class predictions and quaternion orientations
-#             # This requires defining how class and quaternion are related
-#             quat_loss = self.quaternion_consistency_loss(pred_quat, batch["target_quat"])
-#             loss += quat_loss
-
-#         loss_items = loss.detach()
-#         return loss, loss_items
-
-#     @staticmethod
-#     def quaternion_consistency_loss(pred_quat, target_quat):
-#         """
-#         Encourage consistency between class predictions and quaternion orientations.
-#         For example, certain classes might have preferred orientation ranges.
-
-#         Args:
-#             pred_quat (torch.Tensor): Predicted quaternions, shape (B, C, 4)
-#             target_quat (torch.Tensor): Target quaternions, shape (B, C, 4)
-
-#         Returns:
-#             torch.Tensor: Quaternion consistency loss
-#         """
-#         # Example: Use angular loss between predicted and target quaternions
-#         pred_quat = F.normalize(pred_quat, p=2, dim=-1)
-#         target_quat = F.normalize(target_quat, p=2, dim=-1)
-
-#         dot_product = torch.abs((pred_quat * target_quat).sum(dim=-1))
-#         dot_product = torch.clamp(dot_product, min=0.0, max=1.0)
-#         angular_loss = torch.acos(dot_product)  # radians
-
-#         return angular_loss.mean()
-
-# # Modified v8OBBLoss with novel enhancements
-# class v8OBBLoss(v8DetectionLoss):
-#     """Calculates losses for quaternion-based object detection, including rotated bounding boxes."""
-
-#     def __init__(self, model):
-#         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
-#         super().__init__(model)
-#         self.assigner = RotatedTaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
-#         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
-#         self.quat_reg_loss = QuaternionRegularizationLoss(lambda_reg=0.1).to(self.device)
-#         self.geo_consistency_loss = GeometricConsistencyLoss(lambda_geo=0.5).to(self.device)
-#         self.orientation_smoothness_loss = OrientationSmoothnessLoss(lambda_smooth=0.3).to(self.device)
-
-#     def __call__(self, preds, batch):
-#         """Calculate and return the loss for the quaternion-based YOLO model."""
-#         loss = torch.zeros(4, device=self.device)  # box, cls, dfl, quat
-#         feats, pred_angle = preds if isinstance(preds[0], list) else preds[1]
-#         pred_distri, pred_scores, pred_quat = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-#             (self.reg_max * 4, self.nc, self.no - self.reg_max * 4 - self.nc), 1
-#         )
-
-#         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-#         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
-#         pred_quat = pred_quat.permute(0, 2, 1).contiguous()
-
-#         dtype = pred_scores.dtype
-#         batch_size = pred_scores.shape[0]
-#         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
-#         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
-
-#         # Targets
-#         try:
-#             batch_idx = batch["batch_idx"].view(-1, 1)
-#             targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 6)), 1)  # [batch_idx, cls, x, y, w, h, quat]
-#             # Filter out tiny rotated boxes
-#             rw, rh = targets[:, 4] * imgsz[0].item(), targets[:, 5] * imgsz[1].item()
-#             targets = targets[(rw >= 2) & (rh >= 2)]  # filter rotated boxes of tiny size to stabilize training
-#             targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-#             gt_labels, gt_bboxes = targets.split((1, 5), 2)  # cls, [x, y, w, h, quat]
-#             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
-#         except RuntimeError as e:
-#             raise TypeError(
-#                 "ERROR ❌ OBB dataset incorrectly formatted or not an OBB dataset.\n"
-#                 "This error can occur when incorrectly training an 'OBB' model on a 'detect' dataset, "
-#                 "i.e., 'yolo train model=yolov8n-obb.pt data=dota8.yaml'.\nVerify your dataset is a "
-#                 "correctly formatted 'OBB' dataset using 'data=dota8.yaml' "
-#                 "as an example.\nSee https://docs.ultralytics.com/datasets/obb/ for help."
-#             ) from e
-
-#         # Pboxes
-#         pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_quat)  # [x, y, w, h, quat], (b, h*w, 8)
-
-#         # Assign targets
-#         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
-#             pred_scores.detach().sigmoid(),
-#             pred_bboxes.detach()[:, :, :4].type(gt_bboxes.dtype),  # only spatial for assignment
-#             anchor_points * stride_tensor,
-#             gt_labels,
-#             gt_bboxes[..., :4],
-#             mask_gt,
-#         )
-
-#         target_scores_sum = max(target_scores.sum(), 1)
-
-#         # Cls loss
-#         loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
-
-#         # Bbox loss
-#         if fg_mask.sum():
-#             target_bboxes /= stride_tensor
-#             # Extract quaternion components
-#             target_quat = gt_bboxes[fg_mask, 4:8]
-#             pred_quat_fg = pred_bboxes[fg_mask, 4:8]
-#             target_bboxes = target_bboxes[fg_mask, :4]
-#             loss_iou, loss_dfl, loss_quat = self.bbox_loss(
-#                 pred_distri, pred_bboxes[fg_mask, :4], anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask, pred_quat_fg, target_quat
-#             )
-#             loss_quat += self.quat_reg_loss(pred_quat_fg)
-#             # Geometric consistency loss
-#             loss_geo = self.geo_consistency_loss(pred_bboxes[fg_mask, :4], pred_quat_fg)
-#             # Orientation smoothness loss
-#             neighbor_quat = self.get_neighbor_quat(pred_quat_fg)  # Implement this method based on your data
-#             loss_smooth = self.orientation_smoothness_loss(pred_quat_fg, neighbor_quat)
-#             # Aggregate losses
-#             loss[0] += loss_iou * self.hyp.box
-#             loss[2] += loss_dfl * self.hyp.dfl
-#             loss[3] += (loss_quat * self.hyp.quat + loss_geo + loss_smooth)
-#         else:
-#             loss[0] += 0
-#             loss[2] += 0
-#             loss[3] += 0
-
-#         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl, quat)
-
-class E2EDetectLoss:
-    """Criterion class for computing end-to-end training losses for quaternion-based detection."""
-
-    def __init__(self, model):
-        """Initialize E2EDetectLoss with one-to-many and one-to-one quaternion-based detection losses."""
-        self.one2many = v8OBBLoss(model)  # Use v8OBBLoss for one-to-many path
-        self.one2one = v8OBBLoss(model)   # Use v8OBBLoss for one-to-one path
-
-    def __call__(self, preds, batch):
-        """Calculate the sum of the loss for box, cls, dfl, and quat for both detection paths."""
-        preds = preds[1] if isinstance(preds, tuple) else preds
-        one2many = preds["one2many"]
-        loss_one2many, _ = self.one2many(one2many, batch)
-        one2one = preds["one2one"]
-        loss_one2one, _ = self.one2one(one2one, batch)
-        return loss_one2many + loss_one2one, (loss_one2many, loss_one2one)
 
 class GeometricConsistencyLoss(nn.Module):
     """Loss to ensure consistency between bounding box geometry and quaternion orientations."""

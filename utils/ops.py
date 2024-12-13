@@ -6,76 +6,152 @@ import seaborn
 import numpy as np 
 import shapely.geometry
 import math
+  
 
-def bbox2dist(anchor_points, target_bboxes, reg_max):
+def bbox2dist(anchor_points, bboxes, reg_max=16, xywh=True):
     """
-    Convert bounding boxes to distances for DFL.
+    Convert bounding box coordinates to distance distributions for training.
     
     Args:
-        anchor_points: [num_anchors, 2]
-        target_bboxes: [num_anchors, 4]
-        reg_max: int
-    
-    Returns:
-        distances: [num_anchors, 4]
+        anchor_points (torch.Tensor): Anchor points, shape (N_anchors, 2) or (B, N_anchors, 2)
+        bboxes (torch.Tensor): Bounding boxes, shape (N_boxes, 4) or (B, N_boxes, 4)
+        reg_max (int): Maximum value for distance bins
+        xywh (bool): If True, boxes are in [x, y, w, h] format
     """
-    x1, y1, x2, y2 = target_bboxes[:, 0], target_bboxes[:, 1], target_bboxes[:, 2], target_bboxes[:, 3]
-    xa, ya = anchor_points[:, 0], anchor_points[:, 1]
+    # Handle batched inputs
+    is_batched = bboxes.dim() == 3
+    if not is_batched:
+        bboxes = bboxes.unsqueeze(0)
+        anchor_points = anchor_points.unsqueeze(0)
     
-    # Calculate distances
-    d_l = xa - x1
-    d_t = ya - y1
-    d_r = x2 - xa
-    d_b = y2 - ya
+    B = bboxes.shape[0]
+    N_boxes = bboxes.shape[1]  # Number of target boxes
+    N_anchors = anchor_points.shape[1]  # Number of anchor points
     
-    # Clamp distances to [0, reg_max]
-    d_l = torch.clamp(d_l, min=0, max=reg_max)
-    d_t = torch.clamp(d_t, min=0, max=reg_max)
-    d_r = torch.clamp(d_r, min=0, max=reg_max)
-    d_b = torch.clamp(d_b, min=0, max=reg_max)
+    # Convert boxes to xyxy if needed
+    if xywh:
+        x_center, y_center, w, h = bboxes.unbind(-1)
+        x1 = x_center - w/2
+        y1 = y_center - h/2
+        x2 = x_center + w/2
+        y2 = y_center + h/2
+    else:
+        x1, y1, x2, y2 = bboxes.unbind(-1)
     
-    distances = torch.stack([d_l, d_t, d_r, d_b], dim=1)
-    return distances
-
+    device = bboxes.device
+    
+    # Initialize output distributions
+    dist = torch.zeros((B, N_anchors, 4 * reg_max), device=device)
+    
+    # Process each batch
+    for b in range(B):
+        # Get anchors and coordinates for this batch
+        batch_anchors = anchor_points[b]  # [N_anchors, 2]
+        anchor_x, anchor_y = batch_anchors.unbind(-1)  # [N_anchors]
+        
+        # Compute distances to nearest boxes
+        anchor_points_expanded = batch_anchors.unsqueeze(1)  # [N_anchors, 1, 2]
+        box_centers = torch.stack([
+            (x1[b] + x2[b])/2,
+            (y1[b] + y2[b])/2
+        ], dim=-1)  # [N_boxes, 2]
+        
+        # Find nearest boxes
+        distances = torch.norm(
+            anchor_points_expanded - box_centers.unsqueeze(0),
+            dim=-1
+        )  # [N_anchors, N_boxes]
+        box_indices = distances.argmin(dim=1)  # [N_anchors]
+        
+        # Calculate distances to box edges
+        d_left = torch.clamp(
+            anchor_x - x1[b][box_indices],
+            min=0, max=reg_max-1
+        ).long()  # [N_anchors]
+        
+        d_top = torch.clamp(
+            anchor_y - y1[b][box_indices],
+            min=0, max=reg_max-1
+        ).long()  # [N_anchors]
+        
+        d_right = torch.clamp(
+            x2[b][box_indices] - anchor_x,
+            min=0, max=reg_max-1
+        ).long()  # [N_anchors]
+        
+        d_bottom = torch.clamp(
+            y2[b][box_indices] - anchor_y,
+            min=0, max=reg_max-1
+        ).long()  # [N_anchors]
+        
+        # Fill in one-hot encodings
+        # Use offset for each coordinate's bins
+        for i, d_idx in enumerate([d_left, d_top, d_right, d_bottom]):
+            offset = i * reg_max
+            for anchor_idx, bin_idx in enumerate(d_idx):
+                dist[b, anchor_idx, offset + bin_idx] = 1.0
+    
+    # Remove batch dimension if input wasn't batched
+    if not is_batched:
+        dist = dist.squeeze(0)
+    
+    return dist
 
 def dist2bbox(distances, anchor_points, xywh=True):
     """
-    Convert distances to bounding boxes with clamping to ensure numerical stability.
+    Convert distance predictions to bounding boxes.
     
     Args:
-        distances: [batch_size, num_anchors, 4]
-        anchor_points: [num_anchors, 2]
-        xywh: bool, whether to return (x, y, w, h) or (x1, y1, x2, y2)
+        distances (torch.Tensor): Distance predictions
+            Shape can be either:
+            - (N, 4) for unbatched
+            - (B, N, 4) for batched
+        anchor_points (torch.Tensor): Anchor points, shape (N, 2)
+        xywh (bool): If True, return boxes in (x,y,w,h) format, else in (x1,y1,x2,y2)
     
     Returns:
-        bboxes: [batch_size, num_anchors, 4]
+        torch.Tensor: Bounding boxes in same batch format as input
     """
+    # Check if input is batched
+    is_batched = distances.dim() == 3
+    if not is_batched:
+        distances = distances.unsqueeze(0)  # Add batch dim
+        
+    batch_size = distances.size(0)
+    num_anchors = anchor_points.size(0)
+    
+    # Expand anchor points for batch processing
+    # [N, 2] -> [1, N, 2] -> [B, N, 2]
+    anchor_points = anchor_points.unsqueeze(0).expand(batch_size, -1, -1)
+    
+    # Get anchor coordinates, now with batch dimension
+    # [B, N]
+    anchor_x = anchor_points[..., 0]
+    anchor_y = anchor_points[..., 1]
+    
     if xywh:
-        x = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 0])
-        y = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 1])
-        w = distances[:, :, 0] + distances[:, :, 2]
-        h = distances[:, :, 1] + distances[:, :, 3]
+        # center x, center y (maintain batch dimension)
+        c_x = anchor_x + distances[..., 0]  # [B, N]
+        c_y = anchor_y + distances[..., 1]  # [B, N]
+        # width, height
+        w = distances[..., 2].exp()  # [B, N]
+        h = distances[..., 3].exp()  # [B, N]
         
-        # Clamp width and height to prevent negative or extreme values
-        w = torch.clamp(w, min=1.0, max=1e4)
-        h = torch.clamp(h, min=1.0, max=1e4)
-        
-        bboxes = torch.stack([x, y, w, h], dim=2)
+        boxes = torch.stack([c_x, c_y, w, h], dim=-1)  # [B, N, 4]
     else:
-        x1 = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 0]) - distances[:, :, 0]
-        y1 = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 1]) - distances[:, :, 1]
-        x2 = anchor_points[:, 0].unsqueeze(0).expand_as(distances[:, :, 2]) + distances[:, :, 2]
-        y2 = anchor_points[:, 1].unsqueeze(0).expand_as(distances[:, :, 3]) + distances[:, :, 3]
+        # Convert to xyxy format
+        x1 = anchor_x - distances[..., 0]  # [B, N]
+        y1 = anchor_y - distances[..., 1]  # [B, N]
+        x2 = anchor_x + distances[..., 2]  # [B, N]
+        y2 = anchor_y + distances[..., 3]  # [B, N]
         
-        # Clamp coordinates to prevent negative or extreme values
-        x1 = torch.clamp(x1, min=0.0, max=1e4)
-        y1 = torch.clamp(y1, min=0.0, max=1e4)
-        x2 = torch.clamp(x2, min=0.0, max=1e4)
-        y2 = torch.clamp(y2, min=0.0, max=1e4)
+        boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # [B, N, 4]
+    
+    # Remove batch dimension if input was unbatched
+    if not is_batched:
+        boxes = boxes.squeeze(0)
         
-        bboxes = torch.stack([x1, y1, x2, y2], dim=2)
-    return bboxes
-
+    return boxes
 
 def make_anchors(feats, strides, grid_cell_offset=0.5):
     """Generate anchors from features.
@@ -151,80 +227,6 @@ def crop_mask(mask, bbox):
     x1, y1, x2, y2 = bbox.int()
     cropped = mask[y1:y2, x1:x2]
     return cropped
-
-def bbox2dist(anchor_points, bboxes, reg_max=16, xywh=True):
-    """
-    Convert bounding box coordinates to distance distributions for training.
-
-    Args:
-        anchor_points (torch.Tensor): Anchor points, shape (N, 2).
-        bboxes (torch.Tensor): Bounding boxes, shape (N, 4).
-            - If xywh=True: [x_center, y_center, width, height]
-            - If xywh=False: [x1, y1, x2, y2]
-        reg_max (int, optional): Maximum value for distance bins. Default is 16.
-        xywh (bool, optional): If True, boxes are in [x, y, w, h] format. Else, [x1, y1, x2, y2].
-
-    Returns:
-        torch.Tensor: Distance distributions, shape (N, 4 * reg_max).
-    """
-
-    if bboxes.numel() == 0:
-        print("Warning: Empty bboxes tensor!")
-        return
-
-    if xywh:
-        # Ensure bboxes has correct shape
-        if bboxes.dim() != 2 or bboxes.shape[1] != 4:
-            raise ValueError(f"Expected bboxes shape (N, 4), got {bboxes.shape}")
-            
-        x_center, y_center, width, height = bboxes.unbind(1)
-        x1 = x_center - width / 2
-        y1 = y_center - height / 2
-        x2 = x_center + width / 2
-        y2 = y_center + height / 2
-    else:
-        x1, y1, x2, y2 = bboxes.unbind(1)
-
-    # Extract anchor coordinates
-    anchor_x, anchor_y = anchor_points[:, 0], anchor_points[:, 1]
-
-    # Calculate distances from anchors to bbox sides
-    d_left = anchor_x - x1      # Distance from anchor to left side of bbox
-    d_top = anchor_y - y1       # Distance from anchor to top side of bbox
-    d_right = x2 - anchor_x     # Distance from anchor to right side of bbox
-    d_bottom = y2 - anchor_y    # Distance from anchor to bottom side of bbox
-
-    # Clamp distances to [0, reg_max - 1] to avoid overflow
-    d_left = torch.clamp(d_left, min=0, max=reg_max - 1)
-    d_top = torch.clamp(d_top, min=0, max=reg_max - 1)
-    d_right = torch.clamp(d_right, min=0, max=reg_max - 1)
-    d_bottom = torch.clamp(d_bottom, min=0, max=reg_max - 1)
-
-    # Convert distances to integer bin indices
-    d_left_idx = d_left.long()
-    d_top_idx = d_top.long()
-    d_right_idx = d_right.long()
-    d_bottom_idx = d_bottom.long()
-
-    # Initialize one-hot encodings for each distance
-    N = anchor_points.size(0)
-    device = anchor_points.device
-
-    d_left_onehot = torch.zeros((N, reg_max), device=device)
-    d_top_onehot = torch.zeros((N, reg_max), device=device)
-    d_right_onehot = torch.zeros((N, reg_max), device=device)
-    d_bottom_onehot = torch.zeros((N, reg_max), device=device)
-
-    # Scatter 1s at the bin indices
-    d_left_onehot.scatter_(1, d_left_idx.unsqueeze(1), 1)
-    d_top_onehot.scatter_(1, d_top_idx.unsqueeze(1), 1)
-    d_right_onehot.scatter_(1, d_right_idx.unsqueeze(1), 1)
-    d_bottom_onehot.scatter_(1, d_bottom_idx.unsqueeze(1), 1)
-
-    # Concatenate all distance distributions
-    dist = torch.cat([d_left_onehot, d_top_onehot, d_right_onehot, d_bottom_onehot], dim=1)  # Shape: (N, 4 * reg_max)
-
-    return dist
 
 def bbox_to_obb_no_rotation(bbox):
     """

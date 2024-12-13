@@ -1,0 +1,54 @@
+# configs/models/q.yaml
+
+nc: 80  # Number of classes
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # Stage 1: Input is [B, C, 4, H, W] from RGBtoQuatTransform
+  - [-1, 1, QConv2D, {'in_channels': 4, 'out_channels': 64, 'kernel_size': 3, 'stride': 2}]     # P1/2
+  - [0, 1, QConv2D, {'in_channels': 64, 'out_channels': 128, 'kernel_size': 3, 'stride': 2}]   # P2/4
+  - [-1, 2, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': False, 'e': 0.25}]
+  - [-1, 1, QAdaptiveFeatureExtraction, {'channels': 128}]  
+
+  # Stage 2
+  - [-1, 1, QConv2D, {'in_channels': 128, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}]  # P3/8
+  - [-1, 2, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False, 'e': 0.25}]
+  - [-1, 1, QAdaptiveFeatureExtraction, {'channels': 256}]
+
+  # Stage 3
+  - [-1, 1, QConv2D, {'in_channels': 256, 'out_channels': 512, 'kernel_size': 3, 'stride': 2}]  # P4/16
+  - [-1, 2, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': True, 'e': 0.25}]
+  - [-1, 1, QDualAttention, {'channels': 512}]  
+
+  # Stage 4
+  - [-1, 1, QConv2D, {'in_channels': 512, 'out_channels': 1024, 'kernel_size': 3, 'stride': 2}]  # P5/32
+  - [-1, 2, C3k2, {'in_channels': 1024, 'out_channels': 1024, 'c3k': True, 'e': 0.25}]
+  - [-1, 1, SPPF, {'in_channels': 1024, 'out_channels': 1024, 'kernel_size': 5}]
+  - [-1, 1, QDualAttention, {'channels': 1024}]
+
+neck:
+  # Upsampling path
+  - [-1, 1, nn.Upsample, {'scale_factor': 2, 'mode': 'nearest'}]
+  - [[-1, 6], 1, QAdaptiveFusion, {'channels': 1024}]  
+  - [-1, 2, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': False}]
+
+  - [-1, 1, nn.Upsample, {'scale_factor': 2, 'mode': 'nearest'}]
+  - [[-1, 4], 1, QAdaptiveFusion, {'channels': 512}]
+  - [-1, 2, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': False}]
+
+  # Downsampling path
+  - [-1, 1, QConv2D, {'in_channels': 256, 'out_channels': 256, 'kernel_size': 3, 'stride': 2}]
+  - [[-1, 13], 1, QAdaptiveFusion, {'channels': 512}]
+  - [-1, 2, C3k2, {'in_channels': 512, 'out_channels': 512, 'c3k': False}]
+
+  - [-1, 1, QConv2D, {'in_channels': 512, 'out_channels': 512, 'kernel_size': 3, 'stride': 2}]
+  - [[-1, 10], 1, QAdaptiveFusion, {'channels': 1024}]
+  - [-1, 2, C3k2, {'in_channels': 1024, 'out_channels': 1024, 'c3k': True}]
+
+head:
+  - [[16, 19, 22], 1, QEnhancedDetectHead, {'nc': 80, 'ch': [256, 512, 1024]}]

@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from quaternion.conv import QConv2d
+from quaternion.conv import QConv2E
 from models.blocks.block import QAttention, C2PSA, PSABlock, MaxSigmoidAttnBlock
 
 def test_qattention_fixed():

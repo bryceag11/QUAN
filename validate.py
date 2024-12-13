@@ -56,9 +56,9 @@ def main():
     val_dataloader = get_quaternion_dataloader(
         img_dir=val_dataset_info['img_dir'],
         ann_file=val_dataset_info['ann_file'],
-        batch_size=16,
+        batch_size=4,
         shuffle=False,
-        num_workers=4,
+        num_workers=10,
         dataset_type=active_dataset.lower(),  # 'dota' or 'coco'
         transform=transform,
         augmentations=augmentations

@@ -1,6 +1,7 @@
-# configs/models/q_obb.yaml
+# OBB Detection - q_obb.yaml
+# ================================================
 
-nc: 80  # Number of classes
+nc: 80
 scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]
@@ -9,33 +10,37 @@ scales:
   x: [1.00, 1.50, 512]
 
 backbone:
-  - [-1, 1, QConv2d, [in_channels=3, out_channels=64, kernel_size=3, stride=2]]
-  - [-1, 1, QConv2d, [in_channels=64, out_channels=128, kernel_size=3, stride=2]]
-  - [-1, 2, C3k2, [in_channels=128, out_channels=256, param=False, ratio=0.25]]
-  - [-1, 1, QConv2d, [in_channels=256, out_channels=256, kernel_size=3, stride=2]]
-  - [-1, 2, C3k2, [in_channels=256, out_channels=512, param=False, ratio=0.25]]
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=512, kernel_size=3, stride=2]]
-  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=True]]
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=1024, kernel_size=3, stride=2]]
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=1024, param=True]]
-  - [-1, 1, SPPF, [in_channels=1024, out_channels=1024, kernel_size=5]]
-  - [-1, 2, C2PSA, [in_channels=1024, out_channels=1024]]
+  # Same backbone structure as regular detection but with larger channels
+  - [-1, 1, QConv2D, [in_channels=4, out_channels=64, kernel_size=3, stride=2]]               # P1/2: [B, 64, 4, H/2, W/2]
+  - [-1, 1, QConv2D, [in_channels=64, out_channels=128, kernel_size=3, stride=2]]             # P2/4: [B, 128, 4, H/4, W/4]
+  - [-1, 2, C3k2, [in_channels=128, out_channels=256, param=False, ratio=0.25]]               # [B, 256, 4, H/4, W/4]
+  - [-1, 1, QConv2D, [in_channels=256, out_channels=256, kernel_size=3, stride=2]]            # P3/8: [B, 256, 4, H/8, W/8]
+  - [-1, 2, C3k2, [in_channels=256, out_channels=512, param=False, ratio=0.25]]               # [B, 512, 4, H/8, W/8]
+  - [-1, 1, QConv2D, [in_channels=512, out_channels=512, kernel_size=3, stride=2]]            # P4/16: [B, 512, 4, H/16, W/16]
+  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=True]]                           # [B, 512, 4, H/16, W/16]
+  - [-1, 1, QConv2D, [in_channels=512, out_channels=1024, kernel_size=3, stride=2]]           # P5/32: [B, 1024, 4, H/32, W/32]
+  - [-1, 2, C3k2, [in_channels=1024, out_channels=1024, param=True]]                         # [B, 1024, 4, H/32, W/32]
+  - [-1, 1, SPPF, [in_channels=1024, out_channels=1024, kernel_size=5]]                      # [B, 1024, 4, H/32, W/32]
+  - [-1, 2, C2PSA, [in_channels=1024, out_channels=1024]]                                    # Add PSA for rotation features
 
 head:
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, QuaternionConcat, [1]]  # cat backbone P4
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=False]]
+  # Upsampling with enhanced rotation features
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                                               # [B, 1024, 4, H/16, W/16]
+  - [[-1, 6], 1, QuaternionConcat, [1]]                                                      # [B, 1024, 4, H/16, W/16]
+  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=False]]                         # [B, 512, 4, H/16, W/16]
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, QuaternionConcat, [1]]  # cat backbone P3
-  - [-1, 2, C3k2, [in_channels=512, out_channels=256, param=False]]
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]                                               # [B, 512, 4, H/8, W/8]
+  - [[-1, 4], 1, QuaternionConcat, [1]]                                                      # [B, 512, 4, H/8, W/8]
+  - [-1, 2, C3k2, [in_channels=512, out_channels=256, param=False]]                          # [B, 256, 4, H/8, W/8]
 
-  - [-1, 1, QConv2d, [in_channels=256, out_channels=256, kernel_size=3, stride=2]]
-  - [[-1, 13], 1, QuaternionConcat, [1]]  # cat head P4
-  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=False]]
+  # Refine features with orientation awareness
+  - [-1, 1, QConv2D, [in_channels=256, out_channels=256, kernel_size=3, stride=2]]           # [B, 256, 4, H/16, W/16]
+  - [[-1, 13], 1, QuaternionConcat, [1]]                                                     # [B, 512, 4, H/16, W/16]
+  - [-1, 2, C3k2, [in_channels=512, out_channels=512, param=False]]                          # [B, 512, 4, H/16, W/16]
 
-  - [-1, 1, QConv2d, [in_channels=512, out_channels=512, kernel_size=3, stride=2]]
-  - [[-1, 10], 1, QuaternionConcat, [1]]  # cat head P5
-  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=True]]
+  - [-1, 1, QConv2D, [in_channels=512, out_channels=512, kernel_size=3, stride=2]]           # [B, 512, 4, H/32, W/32]
+  - [[-1, 10], 1, QuaternionConcat, [1]]                                                     # [B, 1024, 4, H/32, W/32]
+  - [-1, 2, C3k2, [in_channels=1024, out_channels=512, param=True]]                          # [B, 512, 4, H/32, W/32]
 
-  - [[16, 19, 22], 1, QOBBHead, [nc=80, param=1]]  # Detect(P3, P4, P5)
+  # OBB-specific detection head
+  - [[16, 19, 22], 1, QOBBHead, [nc=80, param=1]]                                            # Outputs: [cls, box, angle]

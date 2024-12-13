@@ -5,88 +5,81 @@ import torch.nn as nn
 from torch.nn.init import constant_, xavier_uniform_
 
 from utils.ops import dist2bbox, dist2rbox, make_anchors
-from quaternion.conv import QConv2d  # Import Quaternion-aware Conv layer
+from quaternion.conv import QConv2D  # Import Quaternion-aware Conv layer
 from quaternion.qactivation import QReLU  # Import Quaternion-aware activation
 from quaternion.qbatch_norm import QBN  # Import Quaternion-aware BatchNorm
+from typing import List, Union
+from quaternion.qbatch_norm import IQBN
 
 class QDetectHead(nn.Module):
     """Quaternion-aware Detection Head for multiple feature levels."""
-    def __init__(self, nc, ch, reg_max=16, param=None, **kwargs):
+    def __init__(self, nc, ch, reg_max=16):
         super().__init__()
-        self.nc = nc
-        self.ch = ch
+        self.nc = nc  # number of classes
         self.reg_max = reg_max
-        self.param = param
-        self.no = nc + 4 * reg_max + 4  # Classes, bbox distributions, quaternions
-
-        # Ensure hidden_dim is a multiple of 4
-        self.hidden_dim = 256  # Must be a multiple of 4
-
-        # Create detection head for each feature level
+        self.no = nc + 4 * reg_max  # outputs per anchor
+        self.nl = len(ch)  # number of detection layers
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+        
+        # Create detection sub-networks
         self.detect_layers = nn.ModuleList()
         for channels in ch:
-            assert channels % 4 == 0, f"Input channels must be multiple of 4, got {channels}"
+            assert channels % 4 == 0, f"Channel count must be multiple of 4, got {channels}"
             head = nn.Sequential(
-                # First conv block
-                QConv2d(channels, self.hidden_dim, kernel_size=3, stride=1, padding=1),
-                QBN(self.hidden_dim),
+                QConv2D(channels, channels, 3, stride=1, padding=1),
+                IQBN(channels // 4),
                 QReLU(),
-
-                # Second conv block
-                QConv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
-                QBN(self.hidden_dim),
+                QConv2D(channels, channels, 3, stride=1, padding=1),
+                IQBN(channels // 4),
                 QReLU(),
-
-                # Final conv to get outputs
-                QConv2d(self.hidden_dim, self.no, kernel_size=1, stride=1)
+                QConv2D(channels, self.no, 1)  # Final layer for predictions
             )
             self.detect_layers.append(head)
+            
+        # Initialize anchors
+        self.anchors = torch.empty(0)
+        self.anchor_points = {}  # Dictionary to store anchor points for each layer
+        self.strides = torch.tensor([8, 16, 32])  # Standard strides for P3, P4, P5
 
     def forward(self, features):
         """
-        Forward pass through the detection head.
-
+        Forward pass of the detection head.
+        
         Args:
-            features (List[torch.Tensor]): List of input feature maps [P3, P4, P5]
-                Each with shape (B, C, H, W) or (C, H, W)
-
+            features: List of feature maps [P3, P4, P5]
+                Each with shape (B, C, 4, H, W)
+        
         Returns:
-            List[torch.Tensor]: List of detection outputs for each feature level,
-                each with shape (B, no, 4, H, W)
+            List of detection outputs for each feature level
         """
         outputs = []
-        for feature, layer in zip(features, self.detect_layers):
-            # Handle different input shapes
-            if feature.dim() == 3:
-                # Assume shape [C, H, W], add batch dimension
-                feature = feature.unsqueeze(0)  # [1, C, H, W]
-            if feature.dim() == 4:
-                B, C, H, W = feature.shape
-                assert C % 4 == 0, f"Channel dimension must be multiple of 4, got {C}"
-                C_quat = C // 4
-                feature = feature.view(B, C_quat, 4, H, W).contiguous()  # [B, C_quat, 4, H, W]
-            elif feature.dim() == 5:
-                B, C, Q, H, W = feature.shape
-                assert Q == 4, f"Expected quaternion dimension to be 4, got {Q}"
-                assert C % 4 == 0, f"Channel dimension must be multiple of 4, got {C}"
-            else:
-                raise ValueError(f"Unexpected feature dimensions: {feature.dim()}D")
-
-            # Reshape to [B*Q, C_quat, H, W]
-            if feature.dim() == 5:
-                B, C_quat, Q, H, W = feature.shape
-                feature_reshaped = feature.permute(0, 2, 1, 3, 4).contiguous().view(B * Q, C_quat, H, W)  # [B*4, C_quat, H, W]
-            else:
-                raise ValueError(f"Unexpected feature dimensions after processing: {feature.dim()}D")
-
-            # Process through detection head
-            out = layer(feature_reshaped)  # [B*4, no, H, W]
-
-            # Reshape back to [B, no, 4, H, W]
-            out = out.view(B, Q, self.no, H, W).permute(0, 2, 1, 3, 4)  # [B, no, 4, H, W]
+        # Process each feature level
+        for i, (feat, layer, stride) in enumerate(zip(features, self.detect_layers, self.strides)):
+            # Generate anchor points if not already computed
+            if i not in self.anchor_points:
+                h, w = feat.shape[-2:]
+                self.anchor_points[i] = self._make_anchors(h, w, stride, feat.device)
+            
+            # Get predictions
+            out = layer(feat)  # [B, no, 4, H, W]
             outputs.append(out)
+        
+        return outputs, self.anchor_points
 
-        return outputs
+    def _make_anchors(self, h, w, stride, device):
+        """Generate anchor points for a given feature map."""
+        grid_y, grid_x = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing='ij'
+        )
+        
+        grid_xy = torch.stack([
+            (grid_x + 0.5) * stride,  # Shift by 0.5 and scale by stride
+            (grid_y + 0.5) * stride
+        ], dim=-1).float()
+        
+        return grid_xy.reshape(-1, 2)  # [H*W, 2]
 
 
 class QOBBHead(nn.Module):
@@ -107,17 +100,17 @@ class QOBBHead(nn.Module):
             assert channels % 4 == 0, f"Input channels must be multiple of 4, got {channels}"
             head = nn.Sequential(
                 # First conv block
-                QConv2d(channels, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QConv2D(channels, self.hidden_dim, kernel_size=3, stride=1, padding=1),
                 QBN(self.hidden_dim),
                 QReLU(),
 
                 # Second conv block
-                QConv2d(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
+                QConv2D(self.hidden_dim, self.hidden_dim, kernel_size=3, stride=1, padding=1),
                 QBN(self.hidden_dim),
                 QReLU(),
 
                 # Final conv to get outputs
-                QConv2d(self.hidden_dim, self.no, kernel_size=1, stride=1)
+                QConv2D(self.hidden_dim, self.no, kernel_size=1, stride=1)
             )
             self.detect_layers.append(head)
 
@@ -175,7 +168,7 @@ class QOBBHead(nn.Module):
 #         """Initializes YOLO classification head to transform input tensor from (b,c1,20,20) to (b,c2) shape."""
 #         super().__init__()
 #         c_ = 1280  # EfficientNet-B0 size, ensure it's divisible by 4
-#         self.conv = QConv2d(c1, c_, kernel_size=k, stride=s, padding=p, groups=g)
+#         self.conv = QConv2D(c1, c_, kernel_size=k, stride=s, padding=p, groups=g)
 #         self.bn = QBatchNorm2d(c_)
 #         self.act = QReLU()
 #         self.pool = nn.AdaptiveAvgPool2d(1)  # to x(b,c_,1,1)
