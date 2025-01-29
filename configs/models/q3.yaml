@@ -1,0 +1,24 @@
+nc: 80  # Number of classes
+backbone:
+  # Same backbone - creates proper pyramid
+  - [-1, 1, QConv2D, {'in_channels': 3, 'out_channels': 32, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # P1/2
+  - [0, 1, QConv2D, {'in_channels': 32, 'out_channels': 64, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # P2/4
+  - [1, 1, QConv2D, {'in_channels': 64, 'out_channels': 128, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # P3/8
+  - [2, 1, QConv2D, {'in_channels': 128, 'out_channels': 256, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # P4/16
+  - [3, 1, QConv2D, {'in_channels': 256, 'out_channels': 512, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # P5/32
+
+neck:
+  # P5 path (H/32)
+  - [4, 1, QConv2D, {'in_channels': 512, 'out_channels': 256, 'kernel_size': 1, 'stride': 1}]  # Reduce P5 channels
+  
+  # P4 path (H/16)
+  - [5, 1, QuaternionUpsample, {'scale_factor': 2, 'mode': 'nearest'}]  # Upsample P5
+  - [[6, 3], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 128}]  # Concat with P4
+  
+  # P3 path (H/8)
+  - [7, 1, QuaternionUpsample, {'scale_factor': 2, 'mode': 'nearest'}]  # Upsample P4
+  - [[8, 2], 1, QuaternionConcat, {'dim': 1, 'reduce': True, 'target_channels': 64}]  # Concat with P3
+
+head:
+  # Now using features at different scales
+  - [[9, 7, 5], 1, QDetectHead, {'nc': 80, 'ch': [64, 128, 256], 'stride': [8, 16, 32]}]  # P3(H/8), P4(H/16), P5(H/32)

@@ -66,121 +66,6 @@ def obb_to_polygon(box):
 
 
 
-def quaternion_bbox_ioa(box1, box2, quats1, quats2, iou=False, eps=1e-7):
-    """
-    Calculate the intersection over box2 area given OBBs with quaternions.
-
-    Args:
-        box1 (torch.Tensor): Bounding boxes, shape (N, 8), format [x, y, w, h, qx, qy, qz, qw].
-        box2 (torch.Tensor): Bounding boxes, shape (M, 8), format [x, y, w, h, qx, qy, qz, qw].
-        quats1 (torch.Tensor): Quaternions for box1, shape (N, 4).
-        quats2 (torch.Tensor): Quaternions for box2, shape (M, 4).
-        iou (bool): Calculate standard IoU if True, else inter_area/box2_area.
-        eps (float): Small value to avoid division by zero.
-
-    Returns:
-        torch.Tensor: Intersection over box2 area, shape (N, M).
-    """
-    if not isinstance(box1, torch.Tensor):
-        box1 = torch.from_numpy(box1).float()
-    if not isinstance(box2, torch.Tensor):
-        box2 = torch.from_numpy(box2).float()
-
-    N = box1.shape[0]
-    M = box2.shape[0]
-
-    if N == 0 or M == 0:
-        return torch.zeros((N, M), device=box1.device)
-
-    # Move to CPU for shapely operations
-    box1_np = box1.cpu().numpy()
-    box2_np = box2.cpu().numpy()
-
-    iou_matrix = torch.zeros((N, M), device=box1.device)
-
-    for i in range(N):
-        box1_poly = obb_to_polygon(box1_np[i])
-        for j in range(M):
-            box2_poly = obb_to_polygon(box2_np[j])
-            inter = box1_poly.intersection(box2_poly).area
-            box2_area = box2[j, 2] * box2[j, 3]  # width * height
-            iou_matrix[i, j] = inter / (box2_area + eps)
-
-    if iou:
-        # If standard IoU is requested, compute the IoU using existing functions
-        return box_iou(box1[:, :4], box2[:, :4], quats1=quats1, quats2=quats2, xywh=False, GIoU=False, DIoU=False, CIoU=False, eps=eps)
-    else:
-        return iou_matrix
-
-
-def bbox_ioa(box1, box2, iou=False, eps=1e-7, quats1=None, quats2=None):
-    """
-    Calculate the intersection over box2 area given box1 and box2. Boxes can be axis-aligned or OBBs with quaternions.
-    """
-    if quats1 is not None and quats2 is not None:
-        # Implement OBB IoA with quaternions
-        return quaternion_bbox_ioa(box1, box2, quats1, quats2, iou=iou, eps=eps)
-    else:
-        # Existing axis-aligned IoA computation
-        b1_x1, b1_y1, b1_x2, b1_y2 = box1.T
-        b2_x1, b2_y1, b2_x2, b2_y2 = box2.T
-
-        inter_area = (np.minimum(b1_x2[:, None], b2_x2) - np.maximum(b1_x1[:, None], b2_x1)).clip(0) * (
-            np.minimum(b1_y2[:, None], b2_y2) - np.maximum(b1_y1[:, None], b2_y1)
-        ).clip(0)
-
-        area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
-        if iou:
-            box1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
-            area = area + box1_area[:, None] - inter_area
-
-        return inter_area / (area + eps)
-
-def box_iou(box1, box2, quats1=None, quats2=None, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-    """
-    Calculate Intersection over Union (IoU) of boxes with optional quaternion support.
-    """
-    if quats1 is not None and quats2 is not None:
-        # Implement quaternion-aware IoU
-        return probiou(box1, box2, CIoU=CIoU, eps=eps)  # Ensure probiou handles quaternions
-    else:
-        # Existing axis-aligned IoU computation
-        if xywh:
-            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
-            w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
-            b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
-            b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
-        else:
-            b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
-            b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
-            w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
-            w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
-
-        inter = (torch.min(b1_x2, b2_x2) - torch.max(b1_x1, b2_x1)).clamp_(0) * (
-            torch.min(b1_y2, b2_y2) - torch.max(b1_y1, b2_y1)
-        ).clamp_(0)
-
-        union = w1 * h1 + w2 * h2 - inter + eps
-
-        iou = inter / union
-        if CIoU or DIoU or GIoU:
-            cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
-            ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
-            if CIoU or DIoU:
-                c2 = cw.pow(2) + ch.pow(2) + eps
-                rho2 = (
-                    (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
-                ) / 4
-                if CIoU:
-                    v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
-                    with torch.no_grad():
-                        alpha = v / (v - iou + (1 + eps))
-                    return iou - (rho2 / c2 + v * alpha)
-                return iou - rho2 / c2
-            c_area = cw * ch + eps
-            return iou - (c_area - union) / c_area
-        return iou
-
 def mask_iou(mask1, mask2, eps=1e-7):
     """
     Calculate masks IoU.
@@ -771,147 +656,246 @@ class DetMetrics(SimpleClass):
     def curves_results(self):
         return self.box.curves_results
 
-# utils/metrics.py
-
-
-class OBBMetrics:
-    def __init__(self, nc, save_dir, plot=True):
-        self.nc = nc  # number of classes
-        self.save_dir = save_dir
-        self.plot = plot
-        
-        # Initialize metric storage
-        self.metrics = {
-            'train': {'loss': [], 'map': [], 'map50': [], 'map75': []},
-            'val': {'loss': [], 'map': [], 'map50': [], 'map75': []}
-        }
-        
-        # Create metrics directory
-        self.metrics_dir = os.path.join(save_dir, 'metrics')
-        os.makedirs(self.metrics_dir, exist_ok=True)
-
-    def update(self, epoch, train_metrics=None, val_metrics=None):
-        """Update metrics with new values."""
-        if train_metrics:
-            for k, v in train_metrics.items():
-                self.metrics['train'][k].append(v)
-        
-        if val_metrics:
-            for k, v in val_metrics.items():
-                self.metrics['val'][k].append(v)
-        
-        # Save metrics to file
-        self._save_metrics()
-
-    def plot(self):
-        """Plot training and validation metrics."""
-        if not self.plot:
-            return
-            
-        # Create figure directory
-        fig_dir = os.path.join(self.metrics_dir, 'figures')
-        os.makedirs(fig_dir, exist_ok=True)
-        
-        # Plot metrics
-        metrics_to_plot = ['loss', 'map', 'map50', 'map75']
-        
-        for metric in metrics_to_plot:
-            plt.figure(figsize=(10, 6))
-            
-            # Plot training metrics
-            if len(self.metrics['train'][metric]) > 0:
-                plt.plot(self.metrics['train'][metric], label=f'Train {metric}')
-            
-            # Plot validation metrics
-            if len(self.metrics['val'][metric]) > 0:
-                plt.plot(self.metrics['val'][metric], label=f'Val {metric}')
-            
-            plt.title(f'{metric} over Time')
-            plt.xlabel('Epoch')
-            plt.ylabel(metric)
-            plt.legend()
-            plt.grid(True)
-            
-            # Save plot
-            plt.savefig(os.path.join(fig_dir, f'{metric}.png'))
-            plt.close()
-
-    def _save_metrics(self):
-        """Save metrics to file."""
-        metrics_file = os.path.join(self.metrics_dir, 'metrics.json')
-        with open(metrics_file, 'w') as f:
-            json.dump(self.metrics, f, indent=4)
-
-    def get_current_metrics(self):
-        """Get the most recent metrics."""
-        current_metrics = {}
-        for phase in ['train', 'val']:
-            for metric, values in self.metrics[phase].items():
-                if values:  # if not empty
-                    current_metrics[f'{phase}_{metric}'] = values[-1]
-        return current_metrics
-
-def bbox_iou(box1, box2, quats1=None, quats2=None, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+def bbox_iou(box1, box2, quats1=None, quats2=None, xywh=False, eps=1e-7):
     """
-    Calculate Intersection over Union (IoU) of two sets of bounding boxes.
+    Compute IoU between two sets of bounding boxes.
 
     Args:
-        box1 (torch.Tensor): Bounding boxes, shape (N, 4).
-        box2 (torch.Tensor): Bounding boxes, shape (M, 4).
-        quats1 (torch.Tensor, optional): Quaternions for box1, shape (N, 4).
-        quats2 (torch.Tensor, optional): Quaternions for box2, shape (M, 4).
-        xywh (bool, optional): If True, boxes are in [x, y, w, h] format.
-        GIoU, DIoU, CIoU (bool, optional): Additional IoU variants.
-        eps (float, optional): Small value to avoid division by zero.
+        box1 (torch.Tensor): First set of boxes
+        box2 (torch.Tensor): Second set of boxes
+        quats1 (torch.Tensor, optional): Quaternions for first set
+        quats2 (torch.Tensor, optional): Quaternions for second set
+        xywh (bool): Whether boxes are in xywh format
+        eps (float): Small epsilon to prevent division by zero
 
     Returns:
-        torch.Tensor: IoU matrix, shape (N, M).
+        torch.Tensor: IoU matrix
     """
-    if quats1 is not None and quats2 is not None:
-        # Implement quaternion-aware IoU
-        return quaternion_bbox_ioa(box1, box2, quats1, quats2, iou=False, eps=eps)
-    else:
-        # Use standard box IoU
-        return standard_box_iou(box1, box2, xywh=xywh, GIoU=GIoU, DIoU=DIoU, CIoU=CIoU, eps=eps)
-
-def standard_box_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
-    """
-    Calculate standard IoU for axis-aligned bounding boxes.
-
-    Args:
-        box1 (torch.Tensor): Bounding boxes, shape (N, 4).
-        box2 (torch.Tensor): Bounding boxes, shape (M, 4).
-        xywh (bool, optional): If True, boxes are in [x, y, w, h] format.
-        GIoU, DIoU, CIoU (bool, optional): Additional IoU variants.
-        eps (float, optional): Small value to avoid division by zero.
-
-    Returns:
-        torch.Tensor: IoU matrix, shape (N, M).
-    """
+    # Convert to xyxy if needed
     if xywh:
-        # Convert [x, y, w, h] to [x1, y1, x2, y2]
-        box1 = xywh2xyxy(box1)
-        box2 = xywh2xyxy(box2)
+        box1 = torch.stack([
+            box1[..., 0] - box1[..., 2] / 2,  # x_min
+            box1[..., 1] - box1[..., 3] / 2,  # y_min
+            box1[..., 0] + box1[..., 2] / 2,  # x_max
+            box1[..., 1] + box1[..., 3] / 2   # y_max
+        ], dim=-1)
+        box2 = torch.stack([
+            box2[..., 0] - box2[..., 2] / 2,  # x_min
+            box2[..., 1] - box2[..., 3] / 2,  # y_min
+            box2[..., 0] + box2[..., 2] / 2,  # x_max
+            box2[..., 1] + box2[..., 3] / 2   # y_max
+        ], dim=-1)
 
-    b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, dim=1)
-    b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, dim=1)
+    # Compute intersection coordinates
+    inter_mins = torch.max(box1[..., :2], box2[..., :2])
+    inter_maxs = torch.min(box1[..., 2:], box2[..., 2:])
+    
+    # Compute intersection area
+    inter_wh = (inter_maxs - inter_mins).clamp(min=0)
+    inter_area = inter_wh[..., 0] * inter_wh[..., 1]
+    
+    # Compute union area
+    area1 = (box1[..., 2] - box1[..., 0]) * (box1[..., 3] - box1[..., 1])
+    area2 = (box2[..., 2] - box2[..., 0]) * (box2[..., 3] - box2[..., 1])
+    
+    # Compute IoU
+    union_area = area1 + area2 - inter_area
+    iou = inter_area / (union_area + eps)
+    
+    return iou
 
-    inter_x1 = torch.max(b1_x1, b2_x1.t())
-    inter_y1 = torch.max(b1_y1, b2_y1.t())
-    inter_x2 = torch.min(b1_x2, b2_x2.t())
-    inter_y2 = torch.min(b1_y2, b2_y2.t())
 
+# def bbox_iou(box1, box2, quats1=None, quats2=None, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+#     """
+#     Calculate Intersection over Union (IoU) of two sets of bounding boxes.
+
+#     Args:
+#         box1 (torch.Tensor): Bounding boxes, shape (N, 4).
+#         box2 (torch.Tensor): Bounding boxes, shape (M, 4).
+#         quats1 (torch.Tensor, optional): Quaternions for box1, shape (N, 4).
+#         quats2 (torch.Tensor, optional): Quaternions for box2, shape (M, 4).
+#         xywh (bool, optional): If True, boxes are in [x, y, w, h] format.
+#         GIoU, DIoU, CIoU (bool, optional): Additional IoU variants.
+#         eps (float, optional): Small value to avoid division by zero.
+
+#     Returns:
+#         torch.Tensor: IoU matrix, shape (N, M).
+#     """
+#     if quats1 is not None and quats2 is not None:
+#         # Implement quaternion-aware IoU
+#         return quaternion_bbox_ioa(box1, box2, quats1, quats2, iou=False, eps=eps)
+#     else:
+#         # Use standard box IoU
+#         return standard_box_iou(box1, box2, xywh=xywh, GIoU=GIoU, DIoU=DIoU, CIoU=CIoU, eps=eps)
+
+def stable_bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    """
+    Compute Intersection over Union (IoU) with enhanced stability and various IoU variants.
+    
+    Args:
+        box1 (torch.Tensor): First set of boxes, shape (N, 4)
+        box2 (torch.Tensor): Second set of boxes, shape (M, 4)
+        xywh (bool): If True, boxes are in (x, y, w, h) format, else (x1, y1, x2, y2)
+        GIoU, DIoU, CIoU (bool): Different IoU variants
+        eps (float): Small value to prevent division by zero
+    
+    Returns:
+        torch.Tensor: IoU matrix, shape (N, M)
+    """
+    # Convert to (x1, y1, x2, y2) format if needed
+    if xywh:
+        b1_x1, b1_y1, b1_w, b1_h = box1.unbind(-1)
+        b2_x1, b2_y1, b2_w, b2_h = box2.unbind(-1)
+        
+        b1_x2 = b1_x1 + b1_w
+        b1_y2 = b1_y1 + b1_h
+        b2_x2 = b2_x1 + b2_w
+        b2_y2 = b2_y1 + b2_h
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.unbind(-1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.unbind(-1)
+    
+    # Compute intersection
+    inter_x1 = torch.max(b1_x1[:, None], b2_x1)
+    inter_y1 = torch.max(b1_y1[:, None], b2_y1)
+    inter_x2 = torch.min(b1_x2[:, None], b2_x2)
+    inter_y2 = torch.min(b1_y2[:, None], b2_y2)
+    
+    # Clamp intersection
     inter_w = (inter_x2 - inter_x1).clamp(min=0)
     inter_h = (inter_y2 - inter_y1).clamp(min=0)
     inter_area = inter_w * inter_h
-
-    area1 = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
-    area2 = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
-
-    union_area = area1 + area2.t() - inter_area + eps
+    
+    # Compute box areas
+    b1_area = (b1_x2 - b1_x1) * (b1_y2 - b1_y1)
+    b2_area = (b2_x2 - b2_x1) * (b2_y2 - b2_y1)
+    
+    # Union area
+    union_area = b1_area[:, None] + b2_area - inter_area + eps
+    
+    # Basic IoU
     iou = inter_area / union_area
-
-    # Handle GIoU, DIoU, CIoU if needed
-    # Placeholder: Implement GIoU, DIoU, CIoU as per your requirements
-
+    
+    if not (GIoU or DIoU or CIoU):
+        return iou
+    
+    # Compute enclosing box
+    c_x1 = torch.min(b1_x1[:, None], b2_x1)
+    c_y1 = torch.min(b1_y1[:, None], b2_y1)
+    c_x2 = torch.max(b1_x2[:, None], b2_x2)
+    c_y2 = torch.max(b1_y2[:, None], b2_y2)
+    
+    # Diagonal length
+    c_area = (c_x2 - c_x1) * (c_y2 - c_y1) + eps
+    
+    # GIoU
+    if GIoU:
+        giou = iou - (c_area - union_area) / c_area
+        return giou
+    
+    # Compute center points
+    b1_center_x = (b1_x1 + b1_x2) / 2
+    b1_center_y = (b1_y1 + b1_y2) / 2
+    b2_center_x = (b2_x1 + b2_x2) / 2
+    b2_center_y = (b2_y1 + b2_y2) / 2
+    
+    # Diagonal length between centers
+    rho = ((b1_center_x[:, None] - b2_center_x) ** 2 +
+           (b1_center_y[:, None] - b2_center_y) ** 2)
+    c2 = (c_x2 - c_x1) ** 2 + (c_y2 - c_y1) ** 2 + eps
+    
+    # DIoU
+    if DIoU:
+        diou = iou - rho / c2
+        return diou
+    
+    # CIoU
+    if CIoU:
+        # Aspect ratio consistency
+        w1 = b1_x2 - b1_x1
+        h1 = b1_y2 - b1_y1
+        w2 = b2_x2 - b2_x1
+        h2 = b2_y2 - b2_y1
+        
+        v = (4 / (math.pi ** 2)) * torch.pow(
+            torch.atan(w2 / h2) - torch.atan(w1 / h1), 2
+        )
+        
+        # Trade-off parameter
+        with torch.no_grad():
+            alpha = v / (v - iou + eps)
+        
+        ciou = iou - (rho / c2 + v * alpha)
+        return ciou
+    
     return iou
+
+def standard_box_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    """
+    Args:
+        box1 (torch.Tensor): Shape [B, N, 4] or [N, 4]
+        box2 (torch.Tensor): Shape [B, M, 4] or [M, 4]
+    """
+    # Handle batched inputs
+    if box1.dim() == 3:
+        B, N, _ = box1.shape
+        M = box2.shape[1]
+        
+        # Compute IoU for each batch independently
+        ious = []
+        for b in range(B):
+            batch_iou = compute_box_iou_2d(
+                box1[b],  # [N, 4]
+                box2[b],  # [M, 4]
+                xywh=xywh,
+                GIoU=GIoU,
+                DIoU=DIoU,
+                CIoU=CIoU,
+                eps=eps
+            )  # [N, M]
+            ious.append(batch_iou)
+        return torch.stack(ious)  # [B, N, M]
+    else:
+        return compute_box_iou_2d(box1, box2, xywh, GIoU, DIoU, CIoU, eps)
+
+def compute_box_iou_2d(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
+    """2D version of box IoU computation"""
+    if xywh:
+        (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+        w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
+        b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
+        b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
+    else:
+        b1_x1, b1_y1, b1_x2, b1_y2 = box1.chunk(4, -1)
+        b2_x1, b2_y1, b2_x2, b2_y2 = box2.chunk(4, -1)
+        w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+        w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+
+    # Compute intersection
+    inter = (torch.min(b1_x2, b2_x2.T) - torch.max(b1_x1, b2_x1.T)).clamp(0) * \
+            (torch.min(b1_y2, b2_y2.T) - torch.max(b1_y1, b2_y1.T)).clamp(0)
+
+    # Union Area
+    w1, h1 = b1_x2 - b1_x1, b1_y2 - b1_y1 + eps
+    w2, h2 = b2_x2 - b2_x1, b2_y2 - b2_y1 + eps
+    union = w1 * h1 + w2.T * h2.T - inter + eps
+
+    # Compute IoU
+    iou = inter / union
+    if CIoU or DIoU or GIoU:
+        cw = torch.max(b1_x2, b2_x2) - torch.min(b1_x1, b2_x1)
+        ch = torch.max(b1_y2, b2_y2) - torch.min(b1_y1, b2_y1)
+        if CIoU or DIoU:
+            c2 = cw.pow(2) + ch.pow(2) + eps
+            rho2 = (
+                (b2_x1 + b2_x2 - b1_x1 - b1_x2).pow(2) + (b2_y1 + b2_y2 - b1_y1 - b1_y2).pow(2)
+            ) / 4
+            if CIoU:
+                v = (4 / math.pi**2) * ((w2 / h2).atan() - (w1 / h1).atan()).pow(2)
+                with torch.no_grad():
+                    alpha = v / (v - iou + (1 + eps))
+                return iou - (rho2 / c2 + v * alpha)
+            return iou - rho2 / c2
+        c_area = cw * ch + eps
+        return iou - (c_area - union) / c_area
+    return iou.clamp(min=eps)  # Ensure no zeros

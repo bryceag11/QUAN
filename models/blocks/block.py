@@ -189,26 +189,13 @@ class SPPF(nn.Module):
             torch.Tensor: Output tensor of shape (B, out_channels, 4, H, W).
         """
         # Initial convolution
-        y = self.cv1(x)  # Shape: (B, c_, 4, H, W)
-        
-        # Apply three max pooling layers and concatenate outputs
-        pooled_outputs = [y]  # Initialize with first convolution output
-        for _ in range(3):
-            B, C, Q, H, W = pooled_outputs[-1].shape
-            # Reshape to [B*Q, C, H, W] to apply MaxPool2d
-            y_reshaped = pooled_outputs[-1].view(B * Q, C, H, W)
-            pooled = self.m(y_reshaped)  # [B*Q, C, H, W]
+        y = self.cv1(x)
+        y1 = self.m(y)          # Pool once
+        y2 = self.m(self.m(y))  # Pool twice 
+        y3 = self.m(self.m(self.m(y)))  # Pool three times
+        out = torch.cat([y, y1, y2, y3], dim=1)
+        return self.cv2(out)
 
-            # Reshape back to [B, C, Q, H, W]
-            pooled = pooled.view(B, C, Q, H, W)
-            pooled_outputs.append(pooled)  # Append pooled output
-        
-        # Concatenate along channel dimension and apply final convolution
-        # pooled_outputs: List of 4 tensors each of shape [B, c_, 4, H, W]
-        # Concatenated along channel dim: [B, c_ * 4, 4, H, W]
-        y = torch.cat(pooled_outputs, dim=1)
-        y = self.cv2(y)  # Project to out_channels: [B, out_channels, 4, H, W]
-        return y
 
 
 class QBottleneck(nn.Module):
@@ -321,7 +308,29 @@ class C3k2(nn.Module):
             self.cv2 = QConv2D(hidden_channels, out_channels, 1)
             self.bn2 = IQBN(out_channels // 4)
             self.act2 = QReLU()
-        
+        # Initialize weights at end of init
+        for m in self.modules():
+            if isinstance(m, QConv2D):
+                nn.init.kaiming_normal_(m.conv_rr.weight, mode='fan_out', nonlinearity='relu')
+                if m.conv_rr.bias is not None:
+                    nn.init.constant_(m.conv_rr.bias, 0)
+                    
+                for conv in [m.conv_ri, m.conv_rj, m.conv_rk]:
+                    nn.init.kaiming_normal_(conv.weight, mode='fan_out', nonlinearity='relu')
+                    if conv.bias is not None:
+                        nn.init.constant_(conv.bias, 0)
+                        
+            elif isinstance(m, IQBN):
+                if hasattr(m, 'gamma'):
+                    nn.init.constant_(m.gamma, 1.0)
+                if hasattr(m, 'beta'):
+                    nn.init.constant_(m.beta, 0.0)
+                    
+            elif isinstance(m, (QBN, nn.BatchNorm2d)):
+                if hasattr(m, 'weight') and m.weight is not None:
+                    nn.init.constant_(m.weight, 1.0)
+                if hasattr(m, 'bias') and m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.c3k:
             return self.module(x)

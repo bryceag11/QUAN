@@ -12,7 +12,7 @@ scales:
 
 backbone:
   # Input: [B, 4, H, W] from RGBtoQuatTransform
-  - [-1, 1, QConv2D, {'in_channels': 4, 'out_channels': 32, 'kernel_size': 3, 'stride': 2}]     # P1/2: [B, 32/2, 4, H/2, W/2]
+  - [-1, 1, QConv2D, {'in_channels': 3, 'out_channels': 32, 'kernel_size': 3, 'stride': 2}]     # P1/2: [B, 32/2, 4, H/2, W/2]
   - [0, 1, QConv2D, {'in_channels': 32, 'out_channels': 64, 'kernel_size': 3, 'stride': 2}]    # P2/4: [B, 64/2, 4, H/4, W/4]
   - [1, 1, C3k2, {'in_channels': 64, 'out_channels': 128, 'c3k': False, 'e': 1}]           # [B, 128, 4, H/4, W/4]
   - [2, 1, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': False, 'e': 1}]          # [B, 128, 4, H/4, W/4]

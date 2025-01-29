@@ -57,17 +57,85 @@ class Trainer:
         self.best_map = 0.0
         self.best_epoch = 0
 
+    def validate(self):
+        """Run validation with mAP calculation."""
+        self.model.eval()
+        val_metrics = {
+            'total_loss': 0.0,
+            'box_loss': 0.0,
+            'cls_loss': 0.0
+        }
+        
+        predictions = []
+        targets = []
+        
+        with torch.no_grad():
+            pbar = tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader), 
+                      desc="Validation", leave=False)
+            
+            for batch_idx, batch in pbar:
+                images = batch['image'].to(self.device)
+                target_boxes = batch['bbox'].to(self.device)
+                target_classes = batch['category'].to(self.device)
+                
+                # Forward pass
+                pred_cls, pred_box = self.model(images)
+                
+                # Compute losses
+                loss_cls, loss_box, total_loss = self.loss_fn(
+                    pred_cls, pred_box,
+                    {'boxes': target_boxes, 'labels': target_classes}
+                )
+                
+                # Update running metrics
+                val_metrics['total_loss'] += total_loss.item()
+                val_metrics['box_loss'] += loss_box.item()
+                val_metrics['cls_loss'] += loss_cls.item()
+                
+                # Get predictions for mAP calculation
+                for level_idx in range(len(pred_cls)):
+                    boxes, classes, scores = get_predictions(
+                        pred_cls[level_idx], 
+                        pred_box[level_idx]
+                    )
+                    predictions.append({
+                        'boxes': boxes,
+                        'scores': scores,
+                        'labels': classes
+                    })
+                    targets.append({
+                        'boxes': target_boxes,
+                        'labels': target_classes
+                    })
+
+                pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
+
+        # Compute mAP
+        self.metrics.process(predictions, targets)
+        map_metrics = self.metrics.results_dict
+
+        # Normalize metrics
+        num_batches = len(self.val_dataloader)
+        for k in ['total_loss', 'box_loss', 'cls_loss']:
+            val_metrics[k] /= num_batches
+
+        # Combine all metrics
+        val_metrics.update(map_metrics)
+        
+        return val_metrics
+
     def train_one_epoch(self, epoch):
-        """Train for one epoch with proper loss handling."""
+        """Train for one epoch with complete loss handling."""
         self.model.train()
         epoch_metrics = {
             'total_loss': 0.0,
             'box_loss': 0.0,
-            'dfl_loss': 0.0,
             'cls_loss': 0.0,
-            'quat_loss': 0.0
         }
         
+        # Added num_samples counter
+        num_samples = 0
+        running_loss = 0.0
         pbar = tqdm(enumerate(self.train_dataloader), total=len(self.train_dataloader), 
                 desc=f"Epoch {epoch+1}", leave=False)
         
@@ -77,74 +145,57 @@ class Trainer:
                 torch.cuda.empty_cache()
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                # Move data to device
-                images = batch['image'].to(self.device, non_blocking=True)
-                target_bboxes = batch['bbox'].to(self.device, non_blocking=True)
-                target_categories = batch['category'].to(self.device, non_blocking=True)
+                images = batch['image'].to(self.device)
+                targets = {
+                    'boxes': batch['bbox'].to(self.device),
+                    'labels': batch['category'].to(self.device)
+                }
                 
+
                 # Forward pass with autocast
                 with torch.amp.autocast('cuda'):
-                    # Get predictions and anchor points from QDetectHead
-                    outputs, anchor_points = self.model(images)
-                    
-                    # Compute target score sum for normalization
-                    target_scores_sum = torch.tensor([target_categories.size(1)], 
-                                                device=self.device)
-                    
-                    # Compute losses
-                    box_loss, dfl_loss, cls_loss, quat_loss = self.loss_fn(
-                        outputs=outputs,
-                        anchor_points=anchor_points,
-                        target_bboxes=target_bboxes,
-                        target_categories=target_categories,
-                        target_scores_sum=target_scores_sum
-                    )
-                    
-                    # Combine losses with appropriate weights
-                    total_loss = box_loss + 0.5 * dfl_loss + cls_loss + 0.1 * quat_loss
-                
-                # Scale and backward
+                    pred_cls, pred_reg, anchors = self.model(images)
+                    total_loss, num_pos = self.loss_fn(pred_cls, pred_reg, targets, anchors)
+
+                # Backward pass
                 self.scaler.scale(total_loss).backward()
                 
-                # Clip gradients
-                if self.grad_clip_val > 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_val)
+                # Gradient clipping
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 
                 # Optimize
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                
+
                 if self.scheduler is not None:
                     self.scheduler.step()
                 
                 # Update metrics
                 epoch_metrics['total_loss'] += total_loss.item()
                 epoch_metrics['box_loss'] += box_loss.item()
-                epoch_metrics['dfl_loss'] += dfl_loss.item()
                 epoch_metrics['cls_loss'] += cls_loss.item()
-                epoch_metrics['quat_loss'] += quat_loss.item()
                 
                 # Update progress bar
-                if batch_idx % 10 == 0:
-                    pbar.set_postfix({
-                        'loss': f"{total_loss.item():.4f}",
-                        'box': f"{box_loss.item():.4f}",
-                        'dfl': f"{dfl_loss.item():.4f}", 
-                        'cls': f"{cls_loss.item():.4f}",
-                        'quat': f"{quat_loss.item():.4f}"
-                    })
-                    
+                pbar.set_postfix({
+                    'loss': f"{total_loss.item():.4f}",
+                    'box': f"{box_loss.item():.4f}",
+                    'cls': f"{cls_loss.item():.4f}"
+                })
+                
             except Exception as e:
                 print(f"\nError in batch {batch_idx}:")
-                print(f"Error message: {str(e)}")
-                raise e
-        
-        # Calculate average metrics
+                print(str(e))
+                continue
+
+
+                
         num_batches = len(self.train_dataloader)
         epoch_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
         
         return epoch_metrics
+    
+
     def _initialize_csv(self):
         """Initialize the CSV log file with headers."""
         with open(self.csv_file, 'w', newline='') as f:
@@ -190,8 +241,8 @@ class Trainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
             'scaler_state_dict': self.scaler.state_dict(),
-            'best_map': self.best_map,
-            'quaternion_state': self.model.get_quaternion_state() if hasattr(self.model, 'get_quaternion_state') else None
+            'metrics': metrics,
+            'best_map': self.best_map
         }
         
         # Save checkpoint

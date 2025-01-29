@@ -20,64 +20,51 @@ class QuaternionConcat(nn.Module):
         self.reduce = reduce
         self.target_channels = target_channels
         
-        if self.reduce and self.target_channels is None:
-            raise ValueError("`target_channels` must be specified when `reduce=True`.")
-        
-        self.reduction_conv = None
-        self.bn = None
-        self.relu = QReLU()
+        if reduce:
+            assert target_channels is not None, "target_channels must be specified when reduce=True"
+            assert target_channels % 4 == 0, "target_channels must be multiple of 4"
+            # Create single quaternion convolution to reduce channels
+            self.reduce_conv = QConv2D(target_channels * 4, target_channels, kernel_size=1)
 
     def forward(self, x: list) -> torch.Tensor:
-        if isinstance(x, torch.Tensor):
-            x = [x]
-            
-
-        # Validate inputs
-        for i, t in enumerate(x):
-            if t.dim() != 5:
-                raise ValueError(f"Tensor {i} has shape {t.shape}. Expected 5 dimensions [B, C, 4, H, W].")
-            if t.shape[2] != 4:
-                raise ValueError(f"Tensor {i} has quaternion dimension {t.shape[2]}, expected 4.")
-
-        # Get largest spatial dimensions
-        max_h = max(t.shape[-2] for t in x)
-        max_w = max(t.shape[-1] for t in x)
+        """
+        Args:
+            x: List of quaternion tensors each of shape [B, C, 4, H, W]
+        Returns:
+            torch.Tensor: Concatenated tensor [B, C', 4, H, W]
+        """
+        # Verify all inputs have quaternion structure
+        assert all(tensor.size(2) == 4 for tensor in x), "All inputs must have quaternion dimension"
         
-        # Upsample smaller tensors to match largest spatial dimensions
-        processed = []
-        for t in x:
-            if t.shape[-2] != max_h or t.shape[-1] != max_w:
-                # Preserve the quaternion dimension during interpolation
-                B, C, Q, H, W = t.shape
-                t_reshaped = t.permute(0, 2, 1, 3, 4).reshape(B*Q, C, H, W)
-                t_upsampled = F.interpolate(t_reshaped, size=(max_h, max_w), mode='nearest')
-                t = t_upsampled.reshape(B, Q, C, max_h, max_w).permute(0, 2, 1, 3, 4)
-            processed.append(t)
-
-        # Concatenate along channel dimension
-        out = torch.cat(processed, dim=1)  # [B, C*len(x), 4, H, W]
-
+        # Concatenate along channel dimension while preserving quaternion structure
+        concat = torch.cat(x, dim=1)  # [B, sum(C), 4, H, W]
+        
+        # Reduce channels if needed
         if self.reduce:
-            if self.reduction_conv is None:
-                # For QConv2D, input_channels should be total channels divided by 4
-                in_channels = out.shape[1] * 4
-                
-                self.reduction_conv = QConv2D(
-                    in_channels=in_channels,
-                    out_channels=self.target_channels,
-                    kernel_size=1,
-                    bias=False
-                ).to(out.device)
-                
-                # BN works on channels divided by 4 due to quaternion structure
-                self.bn = IQBN(self.target_channels // 4).to(out.device)
+            concat = self.reduce_conv(concat)
             
-            # Apply reduction
-            out = self.reduction_conv(out)
-            out = self.bn(out)
-            out = self.relu(out)
+        return concat
 
-        return out
+class QuaternionUpsample(nn.Module):
+    def __init__(self, scale_factor=2, mode='nearest'):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.mode = mode
+    
+    def forward(self, x):
+        B, C, Q, H, W = x.shape
+        
+        # Reshape to handle quaternion components separately
+        x = x.permute(0, 2, 1, 3, 4).reshape(B*Q, C, H, W)
+        
+        # Upsample
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode=self.mode)
+        
+        # Reshape back to quaternion format
+        _, _, H_new, W_new = x.shape
+        x = x.reshape(B, Q, C, H_new, W_new).permute(0, 2, 1, 3, 4)
+        
+        return x
 
 class QuaternionFPN(nn.Module):
     """Feature Pyramid Network for Quaternion Neural Networks."""
