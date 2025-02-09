@@ -37,11 +37,11 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 class Conv(nn.Module):
     default_act = nn.SiLU()  # default activation
 
-    def __init__(self, in_channels, out_channels, k=1, s=1, p=None, g=1, d=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         """Initialize Conv layer with given arguments including activation."""
         super().__init__()
-        self.conv = QConv2D(in_channels, out_channels, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = IQBN(out_channels)
+        self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = IQBN(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x):

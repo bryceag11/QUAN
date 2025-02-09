@@ -73,12 +73,6 @@ def print_model_params(model, indent=''):
                 else:
                     print(f"{indent}🔹 {name} ({module.__class__.__name__})")
                     print(f"{indent}   - Params: {format_num(num_params)}")
-    
-    # Print total statistics
-    print("\n=== Model Summary ===")
-    print(f"Total parameters: {format_num(total_params)}")
-    print(f"Trainable parameters: {format_num(trainable_params)}")
-    print(f"Non-trainable parameters: {format_num(total_params - trainable_params)}")
 
 def main():
     args = parse_args()
@@ -130,7 +124,7 @@ def main():
     # Initialize model
     model, nc = load_model_from_yaml(args.config)
     model = model.to(device)
-    print_model_params(model)
+    # print_model_params(model)
 
     # Count and log parameters
     total_params = sum(p.numel() for p in model.parameters())

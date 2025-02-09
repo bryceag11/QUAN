@@ -47,173 +47,173 @@ class QuaternionPooling(nn.Module):
 
 
 
-class QDetectHead(nn.Module):
-    def __init__(self, nc=80, ch=(), stride=None):
-        super().__init__()
-        self.nc = nc
-        self.nl = len(ch)  
-        self.stride = stride
-        self.ch = ch
+# class QDetectHead(nn.Module):
+#     def __init__(self, nc=80, ch=()):
+#         super().__init__()
+#         self.nc = nc
+#         self.nl = len(ch)  
+#         self.stride = torch.zeros(self.nl)
+#         self.ch = ch
 
-        # Classification heads (real-valued) and quaternion regression heads
-        self.cls_heads = nn.ModuleList()
-        self.reg_heads = nn.ModuleList()
+#         # Classification heads (real-valued) and quaternion regression heads
+#         self.cls_heads = nn.ModuleList()
+#         self.reg_heads = nn.ModuleList()
         
-        # Build heads for each feature level
-        for c in ch:
-            # Classification head - operates on real component only
-            cls_head = nn.Sequential(
-                nn.Conv2d(c//4, c//8, 3, padding=1),  # c//4 because we take real component
-                nn.BatchNorm2d(c//8),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(c//8, self.nc, 1)
-            )
-            self.cls_heads.append(cls_head)
+#         # Build heads for each feature level
+#         for c in ch:
+#             # Classification head - operates on real component only
+#             cls_head = nn.Sequential(
+#                 nn.Conv2d(c//4, c//8, 3, padding=1),  # c//4 because we take real component
+#                 nn.BatchNorm2d(c//8),
+#                 nn.ReLU(inplace=True),
+#                 nn.Conv2d(c//8, self.nc, 1)
+#             )
+#             self.cls_heads.append(cls_head)
             
-            # Box regression head - quaternion-aware for rotation info
-            reg_head = nn.Sequential(
-                QConv2D(c, c//2, 3, padding=1),  # Takes full quaternion input
-                IQBN(c//2),
-                QReLU(),
-                QConv2D(c//2, 16, 1)  # 4 box params × 4 quaternion components
-            )
-            self.reg_heads.append(reg_head)
+#             # Box regression head - quaternion-aware for rotation info
+#             reg_head = nn.Sequential(
+#                 QConv2D(c, c//2, 3, padding=1),  # Takes full quaternion input
+#                 IQBN(c//2),
+#                 QReLU(),
+#                 QConv2D(c//2, 16, 1)  # 4 box params × 4 quaternion components
+#             )
+#             self.reg_heads.append(reg_head)
 
-    def make_anchors(self, feats):
-        """
-        Generate anchor points for quaternion feature maps.
-        feats shape: List of [B, C, 4, H, W]
-        """
-        anchor_points, stride_tensor = [], []
+#     def make_anchors(self, feats):
+#         """
+#         Generate anchor points for quaternion feature maps.
+#         feats shape: List of [B, C, 4, H, W]
+#         """
+#         anchor_points, stride_tensor = [], []
         
-        for i, feat in enumerate(feats):
-            _, _, _, h, w = feat.shape  # Note the 5D shape
-            sx = torch.arange(w, device=feat.device) + 0.5
-            sy = torch.arange(h, device=feat.device) + 0.5
-            sy, sx = torch.meshgrid(sy, sx, indexing='ij')
-            anchor_points.append(torch.stack((sx, sy), -1).reshape(-1, 2) * self.stride[i])
-            stride_tensor.append(torch.full((h * w,), self.stride[i], device=feat.device))
+#         for i, feat in enumerate(feats):
+#             _, _, _, h, w = feat.shape  # Note the 5D shape
+#             sx = torch.arange(w, device=feat.device) + 0.5
+#             sy = torch.arange(h, device=feat.device) + 0.5
+#             sy, sx = torch.meshgrid(sy, sx, indexing='ij')
+#             anchor_points.append(torch.stack((sx, sy), -1).reshape(-1, 2) * self.stride[i])
+#             stride_tensor.append(torch.full((h * w,), self.stride[i], device=feat.device))
             
-        return torch.cat(anchor_points), torch.cat(stride_tensor)
+#         return torch.cat(anchor_points), torch.cat(stride_tensor)
 
-    def forward(self, x):
-        """Forward pass handling quaternion format"""
-        cls_outputs = []
-        reg_outputs = []
+#     def forward(self, x):
+#         """Forward pass handling quaternion format"""
+#         cls_outputs = []
+#         reg_outputs = []
         
-        # Generate anchors from quaternion feature maps
-        anchor_points, stride_tensor = self.make_anchors(x)
+#         # Generate anchors from quaternion feature maps
+#         anchor_points, stride_tensor = self.make_anchors(x)
         
-        for i, feat in enumerate(x):
-            B, C, Q, H, W = feat.shape
+#         for i, feat in enumerate(x):
+#             B, C, Q, H, W = feat.shape
             
-            # Classification: use real component only
-            feat_cls = feat[:, :, 0]  # [B, C, H, W]
-            cls_out = self.cls_heads[i](feat_cls)
+#             # Classification: use real component only
+#             feat_cls = feat[:, :, 0]  # [B, C, H, W]
+#             cls_out = self.cls_heads[i](feat_cls)
             
-            # Regression: use full quaternion tensor
-            reg_out = self.reg_heads[i](feat)  # [B, 16, 4, H, W]
-            reg_out = self._combine_quaternion_components(reg_out)  # [B, 4, H, W]
+#             # Regression: use full quaternion tensor
+#             reg_out = self.reg_heads[i](feat)  # [B, 16, 4, H, W]
+#             reg_out = self._combine_quaternion_components(reg_out)  # [B, 4, H, W]
             
-            # Reshape outputs
-            cls_out = cls_out.view(B, self.nc, -1).permute(0, 2, 1)  # [B, H*W, nc]
-            reg_out = reg_out.view(B, 4, -1).permute(0, 2, 1)  # [B, H*W, 4]
+#             # Reshape outputs
+#             cls_out = cls_out.view(B, self.nc, -1).permute(0, 2, 1)  # [B, H*W, nc]
+#             reg_out = reg_out.view(B, 4, -1).permute(0, 2, 1)  # [B, H*W, 4]
             
-            cls_outputs.append(cls_out)
-            reg_outputs.append(reg_out)
+#             cls_outputs.append(cls_out)
+#             reg_outputs.append(reg_out)
             
-        return cls_outputs, reg_outputs, anchor_points
+#         return cls_outputs, reg_outputs, anchor_points
     
-    def _combine_quaternion_components(self, quat_output):
-        """Simplified quaternion combination focusing on stable predictions"""
-        B, C, Q, H, W = quat_output.shape
-        assert C == 4 and Q == 4
+#     def _combine_quaternion_components(self, quat_output):
+#         """Simplified quaternion combination focusing on stable predictions"""
+#         B, C, Q, H, W = quat_output.shape
+#         assert C == 4 and Q == 4
         
-        # Extract components but use simpler weighting
-        r = quat_output[:, :, 0]  # Real component
-        i = quat_output[:, :, 1]  # First imaginary
-        j = quat_output[:, :, 2]  # Second imaginary 
-        k = quat_output[:, :, 3]  # Third imaginary
+#         # Extract components but use simpler weighting
+#         r = quat_output[:, :, 0]  # Real component
+#         i = quat_output[:, :, 1]  # First imaginary
+#         j = quat_output[:, :, 2]  # Second imaginary 
+#         k = quat_output[:, :, 3]  # Third imaginary
         
-        # Weight real component more heavily
-        combined = (2*r + i + j + k) / 5.0  # Bias toward real component
+#         # Weight real component more heavily
+#         combined = (2*r + i + j + k) / 5.0  # Bias toward real component
         
-        return combined
+#         return combined
         
-    def get_targets(self, imgs, targets):
-        """Assign targets using TaskAlignedAssigner."""
-        batch_size = len(imgs)
-        device = targets['boxes'].device
+#     def get_targets(self, imgs, targets):
+#         """Assign targets using TaskAlignedAssigner."""
+#         batch_size = len(imgs)
+#         device = targets['boxes'].device
         
-        # Make anchors for all feature levels
-        anchors = []
-        for feat in imgs:
-            anchor = make_anchors(feat, self.stride)
-            anchors.append(anchor)
+#         # Make anchors for all feature levels
+#         anchors = []
+#         for feat in imgs:
+#             anchor = make_anchors(feat, self.stride)
+#             anchors.append(anchor)
         
-        anchors = torch.cat(anchors, dim=0)
+#         anchors = torch.cat(anchors, dim=0)
         
-        # Initialize targets
-        target_labels = []
-        target_bboxes = []
-        target_masks = []
+#         # Initialize targets
+#         target_labels = []
+#         target_bboxes = []
+#         target_masks = []
         
-        # Process each image in batch
-        for i in range(batch_size):
-            gt_boxes = targets['boxes'][i]
-            gt_labels = targets['labels'][i]
+#         # Process each image in batch
+#         for i in range(batch_size):
+#             gt_boxes = targets['boxes'][i]
+#             gt_labels = targets['labels'][i]
             
-            # Skip if no ground truth
-            if len(gt_boxes) == 0:
-                target_labels.append(torch.zeros((0, self.nc), device=device))
-                target_bboxes.append(torch.zeros((0, 4), device=device))
-                target_masks.append(torch.zeros(0, dtype=torch.bool, device=device))
-                continue
+#             # Skip if no ground truth
+#             if len(gt_boxes) == 0:
+#                 target_labels.append(torch.zeros((0, self.nc), device=device))
+#                 target_bboxes.append(torch.zeros((0, 4), device=device))
+#                 target_masks.append(torch.zeros(0, dtype=torch.bool, device=device))
+#                 continue
                 
-            # Assign targets using TaskAlignedAssigner
-            assigned = self.assigner(
-                anchors,
-                gt_boxes,
-                gt_labels,
-                imgs[0].new_ones(len(anchors)),  # anchor mask
-                self.nc
-            )
+#             # Assign targets using TaskAlignedAssigner
+#             assigned = self.assigner(
+#                 anchors,
+#                 gt_boxes,
+#                 gt_labels,
+#                 imgs[0].new_ones(len(anchors)),  # anchor mask
+#                 self.nc
+#             )
             
-            target_labels.append(assigned[0])
-            target_bboxes.append(assigned[1])
-            target_masks.append(assigned[2])
+#             target_labels.append(assigned[0])
+#             target_bboxes.append(assigned[1])
+#             target_masks.append(assigned[2])
             
-        return target_labels, target_bboxes, target_masks
+#         return target_labels, target_bboxes, target_masks
         
-    @torch.no_grad()
-    def get_predictions(self, cls_outputs, reg_outputs, conf_thresh=0.25):
-        """Convert network outputs to detections."""
-        predictions = []
+#     @torch.no_grad()
+#     def get_predictions(self, cls_outputs, reg_outputs, conf_thresh=0.25):
+#         """Convert network outputs to detections."""
+#         predictions = []
         
-        for cls_out, reg_out in zip(cls_outputs, reg_outputs):
-            # Apply sigmoid to classification scores
-            scores = torch.sigmoid(cls_out)
+#         for cls_out, reg_out in zip(cls_outputs, reg_outputs):
+#             # Apply sigmoid to classification scores
+#             scores = torch.sigmoid(cls_out)
             
-            # Get max scores and corresponding classes
-            max_scores, pred_classes = scores.max(dim=-1)
+#             # Get max scores and corresponding classes
+#             max_scores, pred_classes = scores.max(dim=-1)
             
-            # Filter by confidence threshold
-            mask = max_scores > conf_thresh
-            if not mask.any():
-                continue
+#             # Filter by confidence threshold
+#             mask = max_scores > conf_thresh
+#             if not mask.any():
+#                 continue
                 
-            # Get filtered predictions
-            filtered_boxes = reg_out[mask]
-            filtered_scores = max_scores[mask]
-            filtered_classes = pred_classes[mask]
+#             # Get filtered predictions
+#             filtered_boxes = reg_out[mask]
+#             filtered_scores = max_scores[mask]
+#             filtered_classes = pred_classes[mask]
             
-            predictions.append({
-                'boxes': filtered_boxes,
-                'scores': filtered_scores,
-                'labels': filtered_classes
-            })
+#             predictions.append({
+#                 'boxes': filtered_boxes,
+#                 'scores': filtered_scores,
+#                 'labels': filtered_classes
+#             })
             
-        return predictions
+#         return predictions
 
 def build_targets(pred_cls: List[torch.Tensor], 
                  pred_box: List[torch.Tensor], 

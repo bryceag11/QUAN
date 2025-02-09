@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-from quaternion.conv import QConv, QConv1D, QConv2D, QConv3D
+from quaternion.conv import QConv, QConv1D, QConv2D, QConv3D, Conv
 from quaternion.qactivation import QHardTanh, QLeakyReLU, QuaternionActivation, QReLU, QPReLU, QREReLU, QSigmoid, QTanh
 from quaternion.qbatch_norm import QBN, IQBN, VQBN
 from typing import List
@@ -141,22 +141,21 @@ class SPPF(nn.Module):
     Spatial Pyramid Pooling - Fast (SPPF) layer for quaternion neural networks.
     Maintains quaternion structure throughout the pooling pyramid.
     """
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 5):
+    def __init__(self, c1, c2, k=5):
         super().__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4"
         
         # Set up intermediate channels (half of in_channels), ensuring multiple of 4
-        c_ = in_channels // 2
+        c_ = c1 // 2
         assert c_ % 4 == 0, "Hidden channels must be a multiple of 4"
 
         # First convolution to reduce channel dimensionality
-        self.cv1 = QConv2D(in_channels, c_, kernel_size=1, stride=1, padding=0, bias=False)
+        self.cv1 = Conv(c1, c_, 1, 1)
         
         # Max pooling with kernel size and stride of 1
-        self.m = QuaternionMaxPool(kernel_size=kernel_size, stride=1)
+        self.m = QuaternionMaxPool(kernel_size=k, stride=1, padding = k//2)
         
         # Final convolution after concatenation to project back to out_channels
-        self.cv2 = QConv2D(c_ * 4, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -192,31 +191,19 @@ class C3k2(nn.Module):
     Enhanced C3k2 with parallel processing paths for quaternion features.
     Maintains cross-stage partial design while preserving quaternion structure.
     """
-    def __init__(self, in_channels: int, out_channels: int, n: int = 1, c3k: bool = False, 
-                 shortcut: bool = True, e: float = 0.5):
+    def __init__(self, c1, c2, n=1, c3k=False, e=0.5, g=1, shortcut=False):
+        """Initializes a CSP bottleneck with 2 convolutions and n Bottleneck blocks for faster processing."""
         super().__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0
-        # Hidden channels must be multiple of 4 for quaternion ops
-        hidden_channels = int(out_channels * e)
-        hidden_channels = (hidden_channels // 4) * 4
-        
-        # Split path
-        self.cv1 = QConv2D(in_channels, hidden_channels, 1)
-        
-        # Main path
-        self.cv2 = QConv2D(in_channels, hidden_channels, 1)
+        self.c = int(c2 * e)  # hidden channels
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
+
         self.m = nn.Sequential(*[
-            C3k(hidden_channels, hidden_channels, shortcut=shortcut) if c3k else 
-            QBottleneck(hidden_channels, hidden_channels, shortcut=shortcut)
+            C3k(self.c, self.c, 2, shortcut, g) if c3k else 
+            QBottleneck(self.c, self.c, shortcut, g)
             for _ in range(n)
         ])
         
-        # Combine paths
-        self.cv3 = QConv2D(2 * hidden_channels, out_channels, 1)
-        
-        # Batch norm and activation
-        self.bn = IQBN(out_channels // 4)
-        self.act = QReLU()
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -228,60 +215,33 @@ class C3k2(nn.Module):
             Output tensor [B, C, 4, H, W]
         """
         # Split processing
-        split_features = self.cv1(x)
+        y = list(self.cv1(x).chunk(2, 1))
         
-        # Main path with bottleneck blocks
-        main_features = self.cv2(x)
-        main_features = self.m(main_features)
+        # Extend with outputs from each module in self.m
+        y.extend(m(y[-1]) for m in self.m)
         
-        # Combine paths along channel dimension
-        # Preserve quaternion structure during concatenation
-        combined = torch.cat([split_features, main_features], dim=1)
-        
-        # Final processing
-        out = self.cv3(combined)
-        out = self.bn(out)
-        out = self.act(out)
-        
-        return out
+        # Combine all paths
+        return self.cv2(torch.cat(y, 1))
+    
 
 class C3k(nn.Module):
     """
     C3k module for quaternion data - CSP bottleneck with customizable kernel sizes.
     This version is designed to work with the parallel C3k2 implementation.
     """
-    def __init__(self, in_channels: int, out_channels: int, n: int = 1, shortcut: bool = True, 
-                 e: float = 0.5, g: int = 1, k: int = 3):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, k=3):
         super().__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiple of 4"
-        
+        c_ = int(c2*e)        
         # Calculate hidden channels (ensure multiple of 4)
-        hidden_channels = int(out_channels * e)
-        hidden_channels = (hidden_channels // 4) * 4
-        
-        # First conv reduces channels
-        self.cv1 = QConv2D(in_channels, hidden_channels, kernel_size=1, stride=1)
-        self.bn1 = IQBN(hidden_channels // 4)
-        self.act1 = QReLU()
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
         
         # Bottleneck block sequence
-        self.m = nn.Sequential(*[
-            QBottleneck(
-                hidden_channels, 
-                hidden_channels,
-                shortcut=shortcut,
-                k=k,
-                groups=g
-            ) for _ in range(n)
-        ])
+        self.m = nn.Sequential(*(QBottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
         
-        # Final conv restores channels
-        self.cv2 = QConv2D(hidden_channels, out_channels, kernel_size=1, stride=1)
-        self.bn2 = IQBN(out_channels // 4)
-        self.act2 = QReLU()
-        
-        self.shortcut = shortcut and in_channels == out_channels
-        
+        self.shortcut = shortcut and c1 == c2
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass maintaining quaternion structure.
@@ -292,62 +252,38 @@ class C3k(nn.Module):
             Output tensor [B, C, 4, H, W]
         """
         # Store identity if using shortcut
-        identity = x if self.shortcut else None
+        # identity = x if self.shortcut else None
         
-        # Initial convolution
-        x = self.cv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
+        # # Initial convolution
+        # x = self.cv1(x)
         
-        # Process through bottlenecks
-        x = self.m(x)
+        # # Process through bottlenecks
+        # x = self.m(x)
         
-        # Final convolution
-        x = self.cv2(x)
-        x = self.bn2(x)
+        # # Final convolution
+        # x = self.cv2(x)
         
-        # Add shortcut if enabled
-        if self.shortcut:
-            x = x + identity
+        # # Add shortcut if enabled
+        # if self.shortcut:
+        #     x = x + identity
             
-        x = self.act2(x)
         
-        return x
+        # return x
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 class QBottleneck(nn.Module):
     """
     Quaternion-aware bottleneck block used in C3k.
     """
-    def __init__(self, in_channels: int, out_channels: int, shortcut: bool = True, 
-                 groups: int = 1, k: int = 3):
+    def __init__(self, c1, c2, shortcut=True, g=1, k =(3, 3), e=0.5):
         super().__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0
-        
-        mid_channels = in_channels // 2  # Reduction in bottleneck
-        mid_channels = (mid_channels // 4) * 4  # Ensure multiple of 4
+        c_ = int(c2 * e)
+
         
         # First 1x1 conv to reduce channels
-        self.cv1 = QConv2D(in_channels, mid_channels, kernel_size=1)
-        self.bn1 = IQBN(mid_channels)
-        self.act1 = QReLU()
-        
-        # kxk conv
-        self.cv2 = QConv2D(
-            mid_channels, 
-            mid_channels, 
-            kernel_size=k,
-            stride=1,
-            padding=k//2
-        )
-        self.bn2 = IQBN(mid_channels)
-        self.act2 = QReLU()
-        
-        # 1x1 conv to restore channels
-        self.cv3 = QConv2D(mid_channels, out_channels, kernel_size=1)
-        self.bn3 = IQBN(out_channels)
-        self.act3 = QReLU()
-        
-        self.shortcut = shortcut and in_channels == out_channels
+        self.cv1 = Conv(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -358,28 +294,19 @@ class QBottleneck(nn.Module):
         Returns:
             Output tensor [B, C, 4, H, W]
         """
-        identity = x if self.shortcut else None
+        identity = x if self.add else None
         
         # First conv + bn + relu
         x = self.cv1(x)
-        x = self.bn1(x)
-        x = self.act1(x)
+
         
         # Second conv + bn + relu
         x = self.cv2(x)
-        x = self.bn2(x)
-        x = self.act2(x)
-        
-        # Third conv + bn
-        x = self.cv3(x)
-        x = self.bn3(x)
         
         # Add shortcut if enabled
-        if self.shortcut:
+        if self.add:
             x = x + identity
-            
-        x = self.act3(x)
-        
+                
         return x
 
 
@@ -398,13 +325,8 @@ class PSABlock(nn.Module):
         
         # FFN with quaternion-aware operations
         # Shape: [B, C, 4, H, W] -> [B, 2C, 4, H, W] -> [B, C, 4, H, W]
-        self.ffn = nn.Sequential(
-            QConv2D(c, (c * 2), 1),
-            IQBN((c * 2)),
-            QReLU(),
-            QConv2D((c * 2), c , 1),
-            IQBN(c )
-        )
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
+
         self.shortcut = shortcut
 
     def forward(self, x):
@@ -497,35 +419,51 @@ class QAttention(nn.Module):
     Quaternion-aware attention module that performs self-attention while preserving quaternion structure.
     
     Args:
-        dim (int): The input quaternion channels (already divided by 4)
+        dim (int): The input quaternion channels
         num_heads (int): Number of attention heads
         attn_ratio (float): Ratio to determine key dimension
     """
     def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        
+        # Ensure dimensions are properly calculated
+        # Calculate dimensions ensuring they're compatible
+        self.head_dim = max(dim // num_heads, 1)
         self.key_dim = int(self.head_dim * attn_ratio)
         self.scale = self.key_dim ** -0.5
         
-        # Calculate dimensions for Q, K, V
-        nh_kd = self.key_dim * num_heads
-        h = dim + nh_kd * 2  # Total hidden dim
+        # Calculate total dimensions for q, k, v
+        self.qk_dim = self.key_dim * num_heads  # For both query and key
+        self.v_dim = self.head_dim * num_heads  # For value
+        self.total_dim = self.qk_dim * 2 + self.v_dim  # Total QKV dimension
         
         # Quaternion-aware layers
-        self.qkv = QConv2D(dim, h, kernel_size=1)  # For Q, K, V projection
-        self.proj = QConv2D(dim, dim, kernel_size=1)  # Output projection
-        self.pe = QConv2D(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim//4)  # Positional encoding
+        self.qkv = QConv2D(dim, self.total_dim, kernel_size=1)
+        self.proj = QConv2D(dim, dim, kernel_size=1)
+        self.pe = QConv2D(dim, dim, kernel_size=3, stride=1, padding=1, groups=dim//4)
         
-        # Layer normalization for stability
+        # Layer normalization
         self.norm = IQBN(dim)
+        
+        # Store split sizes
+        self.split_sizes = [self.qk_dim//4, self.qk_dim//4, self.v_dim//4]
+        print(f"Attention dimensions:")
+        print(f"Input dim: {dim}")
+        print(f"Head dim: {self.head_dim}")
+        print(f"Key dim: {self.key_dim}")
+        print(f"QK dim: {self.qk_dim}")
+        print(f"V dim: {self.v_dim}")
+        print(f"Total dim: {self.total_dim}")
+        print(f"Split sizes: {self.split_sizes}")
+
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass preserving quaternion structure.
         
         Args:
-            x: Input tensor [B, C, 4, H, W] where C is quaternion channels
+            x: Input tensor [B, C, 4, H, W]
         Returns:
             Output tensor [B, C, 4, H, W]
         """
@@ -533,33 +471,41 @@ class QAttention(nn.Module):
         assert Q == 4, "Expected quaternion input (Q=4)"
         N = H * W
         
-        # Project to Q, K, V while preserving quaternion structure
-        qkv = self.qkv(x)  # [B, h, 4, H, W]
+        # Debug prints
+        print(f"\nInput shape: {x.shape}")
         
-        # Reshape and split maintaining quaternion components
-        qkv = qkv.reshape(B, -1, Q, N)  # [B, h, 4, HW]
-        chunks = [self.key_dim, self.key_dim, self.head_dim]
-        q, k, v = qkv.view(B, self.num_heads, -1, Q, N).split(chunks, dim=2)
+        # Project to Q, K, V
+        qkv = self.qkv(x)
+        print(f"After QKV projection: {qkv.shape}")
+        qkv = qkv.reshape(B, -1, Q, H * W)
+        print(f"After QKV reshape: {qkv.shape}")
+
+        # Split into query, key, value
+        q, k, v = qkv.split(self.split_sizes, dim=1)
+        # Reshape to prepare for splitting
+        q = q.reshape(B, self.num_heads, -1, Q, N)
+        k = k.reshape(B, self.num_heads, -1, Q, N)
+        v = v.reshape(B, self.num_heads, -1, Q, N)
+        print(f"After reshape: {q.shape}")
+
+        # Rearrange for attention computation
+        q = q.permute(0, 1, 3, 4, 2)  # [B, heads, Q, key_dim, N]
+        k = k.permute(0, 1, 3, 2, 4)  # [B, heads, Q, N, key_dim]
+        v = v.permute(0, 1, 3, 4, 2)  # [B, heads, Q, N, head_dim]
         
-        # Compute attention scores
-        # Handle each quaternion component separately while maintaining relationships
-        q = q.permute(0, 1, 3, 2, 4)  # [B, num_heads, 4, key_dim, HW]
-        k = k.permute(0, 1, 3, 4, 2)  # [B, num_heads, 4, HW, key_dim]
-        v = v.permute(0, 1, 3, 4, 2)  # [B, num_heads, 4, HW, head_dim]
-        
-        # Compute attention with quaternion structure preservation
-        attn = torch.matmul(q, k) * self.scale  # [B, num_heads, 4, key_dim, key_dim]
+        # Compute attention
+        attn = torch.matmul(q, k) * self.scale
         attn = F.softmax(attn, dim=-1)
         
         # Apply attention to values
-        x = torch.matmul(attn, v)  # [B, num_heads, 4, key_dim, head_dim]
-        x = x.permute(0, 1, 3, 2, 4).reshape(B, C, Q, H, W)
+        x = torch.matmul(attn, v)  # [B, heads, Q, N, head_dim]
         
-        # Add positional encoding to enhance spatial information
+        # Reshape back
+        x = x.permute(0, 1, 4, 2, 3).reshape(B, C, Q, H, W)
+        
+        # Final processing
         pe = self.pe(x)
         x = x + pe
-        
-        # Final projection and normalization
         x = self.proj(x)
         x = self.norm(x)
         
@@ -614,26 +560,22 @@ class MaxSigmoidAttnBlock(nn.Module):
 
 class C2PSA(nn.Module):
     """C2PSA module with proper quaternion handling."""
-    def __init__(self, in_channels: int, out_channels: int, n: int = 1, e: float = 0.5):
+    def __init__(self, c1, c2, n=1, e=0.5):
         super(C2PSA, self).__init__()
-        assert in_channels % 4 == 0 and out_channels % 4 == 0, "Channels must be multiples of 4 for quaternions."
         
-        quat_c1 = in_channels 
-        quat_c2 = out_channels
+
         
-        # Calculate hidden channels ensuring multiple of 4
-        self.c = int(quat_c2 * e)  # e.g., if c2=1024, quat_c2=256, e=0.5 -> c=128
-        
-        # Quaternion-aware convolution to reduce channels
-        self.cv1 = QConv2D(quat_c1, 2 * self.c, kernel_size=1)  # e.g., 256 -> 256
-        self.cv2 = QConv2D(2 * self.c, quat_c2, kernel_size=1)  # e.g., 256 -> 256
+        self.c = int(c1 * e)
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c2, 1)
+
         
         # PSA blocks
         self.m = nn.Sequential(*[
             PSABlock(
                 c=self.c,  # This is already in quaternion channels
                 attn_ratio=0.5,
-                num_heads=max(1, self.c // 64)  # Adjust head count appropriately
+                num_heads=max(1, self.c // 16)  # Adjust head count appropriately
             ) for _ in range(n)
         ])
         
