@@ -1,19 +1,19 @@
 nc: 80  # Number of classes
 backbone:
   # Same backbone - creates proper pyramid
-  - [-1, 1, QConv2D, {'in_channels': 3, 'out_channels': 16, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # 0-P1/2
-  - [-1, 1, QConv2D, {'in_channels': 16, 'out_channels': 32, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # 1-P2/4
+  - [-1, 1, Conv, {'in_channels': 3, 'out_channels': 16, 'k': 3, 's': 2, 'p': 1}]  # 0-P1/2
+  - [-1, 1, Conv, {'in_channels': 16, 'out_channels': 32, 'k': 3, 's': 2, 'p': 1}]  # 1-P2/4
   - [-1, 1, C3k2, {'in_channels': 32, 'out_channels': 64, 'e': 0.25, 'c3k': False}]  # 2
-  - [-1, 1, QConv2D, {'in_channels': 64, 'out_channels': 64, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # 3-P3/8
+  - [-1, 1, Conv, {'in_channels': 64, 'out_channels': 64, 'k': 3, 's': 2, 'p': 1}]  # 3-P3/8
   - [-1, 1, C3k2, {'in_channels': 64, 'out_channels': 128, 'e': 0.25, 'c3k': False}]  # 4
-  - [-1, 1, QConv2D, {'in_channels': 128, 'out_channels': 128, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # 5-P4/16
+  - [-1, 1, Conv, {'in_channels': 128, 'out_channels': 128, 'k': 3, 's': 2, 'p': 1}]  # 5-P4/16
   - [-1, 1, C3k2, {'in_channels': 128, 'out_channels': 128, 'c3k': True}]  # 6
-  - [-1, 1, QConv2D, {'in_channels': 128, 'out_channels': 256, 'kernel_size': 3, 'stride': 2, 'padding': 1}]  # 7-P5/32
+  - [-1, 1, Conv, {'in_channels': 128, 'out_channels': 256, 'k': 3, 's': 2, 'p': 1}]  # 7-P5/32
   - [-1, 1, C3k2, {'in_channels': 256, 'out_channels': 256, 'c3k': True}]  # 8
   - [-1, 2, SPPF, {'in_channels': 256, 'out_channels': 256}]  # 9
   - [-1, 1, C2PSA, {'in_channels': 256, 'out_channels': 256}]  # 10
 
-head:
+neck:
   - [-1, 1, QuaternionUpsample, {'scale_factor': 2, 'mode': 'nearest'}]
   - [[-1, 6], 1, QuaternionConcat,  {'dim': 1, 'reduce': False}] # cat backbone P4
   - [-1, 1, C3k2, {'in_channels': 384, 'out_channels': 128}] # 13
@@ -22,12 +22,12 @@ head:
   - [[-1, 4], 1, QuaternionConcat, {'dim': 1, 'reduce': False,}] # cat backbone P3
   - [-1, 1, C3k2, {'in_channels': 256, 'out_channels': 64}] # 16 p3/8
 
-  - [-1, 1, QConv2D, {'in_channels': 64, 'out_channels': 64, 'kernel_size': 3, 'stride': 2, 'padding': 1}] 
+  - [-1, 1, Conv, {'in_channels': 64, 'out_channels': 64, 'k': 3, 's': 2, 'p': 1}] 
   - [[-1, 13], 1, QuaternionConcat, {'dim': 1, 'reduce': False}] # cat head P4
   - [-1, 1, C3k2, {'in_channels': 192, 'out_channels': 128}] # 19 (P4/16-medium)
 
-  - [-1, 1, QConv2D, {'in_channels': 128, 'out_channels': 128, 'kernel_size': 3, 'stride': 2, 'padding': 1}]
+  - [-1, 1, Conv, {'in_channels': 128, 'out_channels': 128, 'k': 3, 's': 2, 'p': 1}]
   - [[-1, 10], 1, QuaternionConcat, {'dim': 1, 'reduce': False}] # cat head P5
   - [-1, 2, C3k2, {'in_channels': 384, 'out_channels': 256, 'c3k': True}] # 22 (P5/32-large)
-
+head:
   - [[16, 19, 22], 1, QDetectHead, {'nc': 80, 'ch': [64, 128, 256], 'stride': [8, 16, 32]}]  # P3(H/8), P4(H/16), P5(H/32)

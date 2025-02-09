@@ -2,9 +2,9 @@
 
 import torch.nn as nn
 import yaml
-from quaternion.conv import QConv, QConv2D
+from quaternion.conv import Conv, QConv, QConv2D
 from quaternion.init import QInit
-from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape, QAdaptiveFeatureExtraction, QDualAttention, QAdaptiveFusion
+from .blocks.block import C3k2, SPPF, C2PSA , PSABlock
 from .neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN, QuaternionUpsample
 from .heads.qdet_head import QDetectHead, QOBBHead, QuaternionPooling
 import torch 
@@ -70,8 +70,8 @@ def load_model_from_yaml(config_path):
     
     # Define your module dictionary
     module_dict = {
+        'Conv': Conv,
         'QConv': QConv,
-        'Reshape': Reshape,
         'QConv2D': QConv2D,
         'C3k2': C3k2,
         'PSABlock': PSABlock,
@@ -82,9 +82,9 @@ def load_model_from_yaml(config_path):
         'QOBBHead': QOBBHead,
         'QDetectHead': QDetectHead,
         'QuaternionPooling': QuaternionPooling,
-        'QAdaptiveFeatureExtraction': QAdaptiveFeatureExtraction,
-        'QDualAttention': QDualAttention,
-        'QAdaptiveFusion': QAdaptiveFusion,
+        # 'QAdaptiveFeatureExtraction': QAdaptiveFeatureExtraction,
+        # 'QDualAttention': QDualAttention,
+        # 'QAdaptiveFusion': QAdaptiveFusion,
         'QuaternionUpsample': QuaternionUpsample
         # Add other layers as needed
     }
@@ -145,7 +145,7 @@ def build_from_cfg(cfg, module_dict):
                 
                 layers.append(module_instance)
 
-    print("Layer References (build_from_cfg):", layer_refs)
+    # print("Layer References (build_from_cfg):", layer_refs)
     return nn.ModuleList(layers), layer_refs
 
 

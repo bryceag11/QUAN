@@ -12,3 +12,4 @@ Scripts/
 *.png
 *.json
 *.pth
+saved_models/pytorch_cifar10_quaternion.pth
