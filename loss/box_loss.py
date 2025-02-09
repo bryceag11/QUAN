@@ -166,70 +166,79 @@ def debug_predictions(pred_cls, pred_reg, targets=None, conf_threshold=0.25):
             print("-" * 50)
 
 
+
+
 def get_classification_metrics(pred_cls, targets, nc):
     """
-    Compute detailed classification metrics with error handling
+    Compute classification metrics for quaternion detection network
     
     Args:
-        pred_cls (list): Classification predictions from each level
-        targets (dict): Ground truth targets
+        pred_cls (list): List of classification predictions [B, HW, nc] for each level
+        targets (dict): Ground truth targets containing 'labels'
         nc (int): Number of classes
     
     Returns:
-        dict: Detailed metrics
+        dict: Classification metrics
     """
     device = pred_cls[0].device
     total_correct = 0
     total_samples = 0
-    per_class_correct = {}
-    per_class_total = {}
+    total_confident = 0  # Predictions above confidence threshold
+    
+    # Track per-class metrics
+    per_class_stats = {i: {'correct': 0, 'total': 0} for i in range(nc)}
     
     for level_preds in pred_cls:
-        B, HW, nc_pred = level_preds.shape
-        assert nc_pred == nc, f"Prediction channels {nc_pred} do not match expected {nc}"
+        # Apply sigmoid to get probabilities
+        probs = torch.sigmoid(level_preds)  # [B, HW, nc]
         
-        for b in range(B):
+        # Get confident predictions
+        confidence_mask = probs.max(dim=-1)[0] > 0.5
+        total_confident += confidence_mask.sum().item()
+        
+        # For each batch
+        for b in range(probs.shape[0]):
             gt_labels = targets['labels'][b]
-            
             if len(gt_labels) == 0:
                 continue
-            
-            # Apply softmax to get probabilities
-            probs = F.softmax(level_preds[b], dim=-1)
-            avg_pred = probs.mean(dim=0)  # Average across spatial locations
-            
-            # Sanity check labels
-            valid_labels = [
-                label.item() for label in gt_labels 
-                if 0 <= label.item() < nc
-            ]
-            
-            if not valid_labels:
-                print(f"No valid labels for batch {b}")
-                continue
-            
-            pred_class = avg_pred.argmax().item()
-            
-            # Track per-class metrics
-            for label in valid_labels:
-                per_class_total[label] = per_class_total.get(label, 0) + 1
                 
-                if pred_class == label:
-                    total_correct += 1
-                    per_class_correct[label] = per_class_correct.get(label, 0) + 1
+            # Get predictions for this batch
+            batch_preds = probs[b]  # [HW, nc]
+            pred_classes = batch_preds.argmax(dim=-1)  # [HW]
+            
+            # Match predictions to ground truth
+            for gt_label in gt_labels:
+                if gt_label >= nc:
+                    continue
+                    
+                # Find best matching prediction
+                matched_idx = (pred_classes == gt_label).nonzero()
+                if len(matched_idx) > 0:
+                    # Use highest confidence match
+                    matched_probs = batch_preds[matched_idx.squeeze(-1), gt_label]
+                    best_match_idx = matched_probs.argmax()
+                    if matched_probs[best_match_idx] > 0.5:
+                        total_correct += 1
+                        per_class_stats[gt_label.item()]['correct'] += 1
                 
                 total_samples += 1
+                per_class_stats[gt_label.item()]['total'] += 1
+
+    # Compute metrics
+    accuracy = total_correct / max(total_samples, 1)
+    precision = total_correct / max(total_confident, 1)
     
-    # Compute per-class metrics
+    # Per-class accuracy
     per_class_accuracy = {}
-    for label, total in per_class_total.items():
-        correct = per_class_correct.get(label, 0)
-        per_class_accuracy[label] = correct / total * 100
+    for class_id, stats in per_class_stats.items():
+        if stats['total'] > 0:
+            per_class_accuracy[class_id] = stats['correct'] / stats['total']
     
     return {
-        'overall_accuracy': total_correct / max(total_samples, 1) * 100,
-        'correct': total_correct,
+        'accuracy': accuracy,
+        'precision': precision,
         'total_samples': total_samples,
+        'total_confident': total_confident,
         'per_class_accuracy': per_class_accuracy
     }
 

@@ -4,7 +4,7 @@ import torch.nn as nn
 import yaml
 from quaternion.conv import QConv, QConv2D
 from quaternion.init import QInit
-from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape, QAdaptiveFeatureExtraction, QDualAttention, QEnhancedDetectHead, QAdaptiveFusion
+from .blocks.block import C3k2, SPPF, C2PSA , PSABlock, Reshape, QAdaptiveFeatureExtraction, QDualAttention, QAdaptiveFusion
 from .neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN, QuaternionUpsample
 from .heads.qdet_head import QDetectHead, QOBBHead, QuaternionPooling
 import torch 
@@ -85,7 +85,6 @@ def load_model_from_yaml(config_path):
         'QAdaptiveFeatureExtraction': QAdaptiveFeatureExtraction,
         'QDualAttention': QDualAttention,
         'QAdaptiveFusion': QAdaptiveFusion,
-        'QEnhancedDetectHead': QEnhancedDetectHead,
         'QuaternionUpsample': QuaternionUpsample
         # Add other layers as needed
     }
@@ -103,6 +102,10 @@ def load_model_from_yaml(config_path):
     model = CustomModel(backbone, neck_tuple, head)
     
     return model, nc
+
+
+
+
 
 def build_from_cfg(cfg, module_dict):
     """Build a module from the configuration."""

@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import OneCycleLR  # Changed from CosineAnnealingL
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Quaternion-based Object Detection Model")
-    parser.add_argument('--config', type=str, default='configs/models/q3.yaml', help='Path to model config')
+    parser.add_argument('--config', type=str, default='configs/models/q4.yaml', help='Path to model config')
     parser.add_argument('--data', type=str, default='configs/default_config.yaml', help='Path to data config')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size')
@@ -31,6 +31,54 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
+
+def print_model_params(model, indent=''):
+    """
+    Print parameters for each layer in the model with proper formatting for quaternion layers.
+    
+    Args:
+        model: PyTorch model
+        indent: Indentation string for nested layers
+    """
+    total_params = 0
+    trainable_params = 0
+    
+    # Helper function to format parameter count
+    def format_num(num):
+        if num >= 1e6:
+            return f"{num/1e6:.2f}M"
+        elif num >= 1e3:
+            return f"{num/1e3:.2f}K"
+        return str(num)
+    
+    for name, module in model.named_modules():
+        if len(list(module.children())) == 0:  # If it's a leaf module
+            num_params = sum(p.numel() for p in module.parameters())
+            num_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            
+            if num_params > 0:  # Only print layers with parameters
+                total_params += num_params
+                trainable_params += num_trainable
+                
+                # Special formatting for quaternion layers
+                if any(qtype in module.__class__.__name__ for qtype in ['QConv', 'IQBN', 'QBN', 'VQBN']):
+                    print(f"{indent}📊 {name} ({module.__class__.__name__})")
+                    print(f"{indent}   - Total params: {format_num(num_params)}")
+                    print(f"{indent}   - Trainable: {format_num(num_trainable)}")
+                    
+                    # Print quaternion component info if available
+                    if hasattr(module, 'in_channels') and hasattr(module, 'out_channels'):
+                        print(f"{indent}   - In channels: {module.in_channels} (quaternion)")
+                        print(f"{indent}   - Out channels: {module.out_channels} (quaternion)")
+                else:
+                    print(f"{indent}🔹 {name} ({module.__class__.__name__})")
+                    print(f"{indent}   - Params: {format_num(num_params)}")
+    
+    # Print total statistics
+    print("\n=== Model Summary ===")
+    print(f"Total parameters: {format_num(total_params)}")
+    print(f"Trainable parameters: {format_num(trainable_params)}")
+    print(f"Non-trainable parameters: {format_num(total_params - trainable_params)}")
 
 def main():
     args = parse_args()
@@ -82,7 +130,8 @@ def main():
     # Initialize model
     model, nc = load_model_from_yaml(args.config)
     model = model.to(device)
-    
+    print_model_params(model)
+
     # Count and log parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -165,7 +214,6 @@ def main():
         vis_batch_freq=100
     )
     
-    # Training loop
     print("Starting training...")
     for epoch in range(start_epoch, args.epochs):
         print(f"\n=== Epoch {epoch+1}/{args.epochs} ===")
@@ -174,23 +222,71 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
         
-        # Train and validate
+        # Train one epoch
         train_metrics = trainer.train_one_epoch(epoch)
+        print(f"\nTraining Results:")
+        print(f"Loss: {train_metrics['total_loss']:.4f}")
+        print(f"Positive samples: {train_metrics['num_pos']}")
         
-        # Validate every 5 epochs
-        if epoch % 5 == 0 or epoch == args.epochs - 1:
-            torch.cuda.empty_cache()
+        # Validate every 5 epochs and on last epoch
+        if (epoch + 1) % 5 == 0 or epoch == args.epochs - 1:
+            print("\nRunning validation...")
             val_metrics = trainer.validate()
-            print("\nValidation Results:")
-            for k, v in val_metrics.items():
-                print(f"{k}: {v:.4f}")
             
-            # Save best model
-            trainer.validate_and_save(epoch)
+            # Print validation metrics
+            print("\nValidation Results:")
+            print(f"Loss: {val_metrics['total_loss']:.4f}")
+            print(f"mAP50: {val_metrics['metrics/mAP50(B)']:.4f}")
+            print(f"mAP50-95: {val_metrics['metrics/mAP50-95(B)']:.4f}")
+            
+            # Update and plot metrics
+            metrics.update({
+                'train/loss': train_metrics['total_loss'],
+                'val/loss': val_metrics['total_loss'],
+                'val/mAP50': val_metrics['metrics/mAP50(B)'],
+                'val/mAP50-95': val_metrics['metrics/mAP50-95(B)']
+            })
+            
+            # Save checkpoint if best validation mAP
+            if val_metrics['metrics/mAP50(B)'] > best_map50:
+                best_map50 = val_metrics['metrics/mAP50(B)']
+                print(f"\nBest mAP50 {best_map50:.4f}")
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'scaler_state_dict': scaler.state_dict(),
+                    'best_map50': best_map50,
+                    'train_metrics': train_metrics,
+                    'val_metrics': val_metrics
+                }
+                torch.save(checkpoint, os.path.join(args.save_dir, 'best.pt'))
+            
+            # Save last checkpoint
+            if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                    'scaler_state_dict': scaler.state_dict(),
+                    'best_map50': best_map50,
+                    'train_metrics': train_metrics,
+                    'val_metrics': val_metrics
+                }
+                torch.save(checkpoint, os.path.join(args.save_dir, f'epoch_{epoch+1}.pt'))
         
-        # Update and plot metrics
-        metrics.update(epoch=epoch, train_metrics=train_metrics, val_metrics=val_metrics)
-        metrics.plot()
+        # Plot metrics
+        if metrics.curves is not None:
+            metrics.plot_curves()
+            
+        # Update progress
+        if scheduler is not None:
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"\nLearning rate: {current_lr:.6f}")
+            
+    print(f"\nTraining completed. Best mAP50: {best_map50:.4f}")
 
 if __name__ == "__main__":
     main()

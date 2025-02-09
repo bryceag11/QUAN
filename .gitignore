@@ -11,3 +11,4 @@ Include/
 Scripts/
 *.png
 *.json
+*.pth

@@ -57,105 +57,43 @@ class Trainer:
         self.best_map = 0.0
         self.best_epoch = 0
 
-    def validate(self):
-        """Run validation with mAP calculation."""
-        self.model.eval()
-        val_metrics = {
-            'total_loss': 0.0,
-            'box_loss': 0.0,
-            'cls_loss': 0.0
-        }
-        
-        predictions = []
-        targets = []
-        
-        with torch.no_grad():
-            pbar = tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader), 
-                      desc="Validation", leave=False)
-            
-            for batch_idx, batch in pbar:
-                images = batch['image'].to(self.device)
-                target_boxes = batch['bbox'].to(self.device)
-                target_classes = batch['category'].to(self.device)
-                
-                # Forward pass
-                pred_cls, pred_box = self.model(images)
-                
-                # Compute losses
-                loss_cls, loss_box, total_loss = self.loss_fn(
-                    pred_cls, pred_box,
-                    {'boxes': target_boxes, 'labels': target_classes}
-                )
-                
-                # Update running metrics
-                val_metrics['total_loss'] += total_loss.item()
-                val_metrics['box_loss'] += loss_box.item()
-                val_metrics['cls_loss'] += loss_cls.item()
-                
-                # Get predictions for mAP calculation
-                for level_idx in range(len(pred_cls)):
-                    boxes, classes, scores = get_predictions(
-                        pred_cls[level_idx], 
-                        pred_box[level_idx]
-                    )
-                    predictions.append({
-                        'boxes': boxes,
-                        'scores': scores,
-                        'labels': classes
-                    })
-                    targets.append({
-                        'boxes': target_boxes,
-                        'labels': target_classes
-                    })
-
-                pbar.set_postfix({'loss': f"{total_loss.item():.4f}"})
-
-        # Compute mAP
-        self.metrics.process(predictions, targets)
-        map_metrics = self.metrics.results_dict
-
-        # Normalize metrics
-        num_batches = len(self.val_dataloader)
-        for k in ['total_loss', 'box_loss', 'cls_loss']:
-            val_metrics[k] /= num_batches
-
-        # Combine all metrics
-        val_metrics.update(map_metrics)
-        
-        return val_metrics
-
     def train_one_epoch(self, epoch):
-        """Train for one epoch with complete loss handling."""
+        """Train for one epoch with visualization and metrics."""
         self.model.train()
         epoch_metrics = {
             'total_loss': 0.0,
-            'box_loss': 0.0,
-            'cls_loss': 0.0,
+            'num_pos': 0
         }
         
-        # Added num_samples counter
-        num_samples = 0
-        running_loss = 0.0
+        if epoch == 0:  # Or based on memory monitoring
+            torch.cuda.empty_cache()
+        
         pbar = tqdm(enumerate(self.train_dataloader), total=len(self.train_dataloader), 
                 desc=f"Epoch {epoch+1}", leave=False)
         
+        # Zero gradients once before the loop if using set_to_none=True
+        self.optimizer.zero_grad(set_to_none=True)
+        
         for batch_idx, batch in pbar:
             try:
-                # Clear memory and gradients
-                torch.cuda.empty_cache()
-                self.optimizer.zero_grad(set_to_none=True)
+                # Move data to device - this is now non-blocking due to pin_memory=True
+                images = batch['image'].to(self.device, non_blocking=True)
+                target_boxes = batch['bbox'].to(self.device, non_blocking=True)
+                target_labels = batch['category'].to(self.device, non_blocking=True)
                 
-                images = batch['image'].to(self.device)
                 targets = {
-                    'boxes': batch['bbox'].to(self.device),
-                    'labels': batch['category'].to(self.device)
+                    'boxes': target_boxes,
+                    'labels': target_labels
                 }
-                
 
                 # Forward pass with autocast
                 with torch.amp.autocast('cuda'):
                     pred_cls, pred_reg, anchors = self.model(images)
-                    total_loss, num_pos = self.loss_fn(pred_cls, pred_reg, targets, anchors)
+                    loss_dict = self.loss_fn(pred_cls, pred_reg, targets, anchors)
+
+                # Extract loss and num_pos from dict
+                total_loss = loss_dict['loss']
+                num_pos = loss_dict['num_pos']
 
                 # Backward pass
                 self.scaler.scale(total_loss).backward()
@@ -171,16 +109,31 @@ class Trainer:
                 if self.scheduler is not None:
                     self.scheduler.step()
                 
+                self.optimizer.zero_grad(set_to_none=True)
+
                 # Update metrics
                 epoch_metrics['total_loss'] += total_loss.item()
-                epoch_metrics['box_loss'] += box_loss.item()
-                epoch_metrics['cls_loss'] += cls_loss.item()
+                epoch_metrics['num_pos'] += num_pos
                 
+                # Visualize batch
+                # if self.visualize and batch_idx % self.vis_batch_freq == 0:
+                #     # Concatenate predictions from all feature levels
+                #     all_cls = torch.cat([p.view(p.size(0), -1, p.size(-1)) for p in pred_cls], dim=1)
+                #     all_reg = torch.cat([r.view(r.size(0), -1, r.size(-1)) for r in pred_reg], dim=1)
+                    
+                #     self.visualize_batch(
+                #         images=images,
+                #         pred_dist=all_reg,
+                #         pred_scores=torch.sigmoid(all_cls),
+                #         target_bboxes=targets['boxes'],
+                #         target_categories=targets['labels'],
+                #         batch_idx=batch_idx,
+                #         epoch=epoch
+                #     )
                 # Update progress bar
                 pbar.set_postfix({
                     'loss': f"{total_loss.item():.4f}",
-                    'box': f"{box_loss.item():.4f}",
-                    'cls': f"{cls_loss.item():.4f}"
+                    'pos': num_pos
                 })
                 
             except Exception as e:
@@ -188,13 +141,110 @@ class Trainer:
                 print(str(e))
                 continue
 
-
-                
+        # Average the loss over batches
         num_batches = len(self.train_dataloader)
-        epoch_metrics = {k: v / num_batches for k, v in epoch_metrics.items()}
+        epoch_metrics['total_loss'] /= num_batches
+        
+        # Plot training curves using your existing metrics
+        if hasattr(self, 'metrics') and hasattr(self.metrics, 'plot'):
+            self.metrics.plot()
         
         return epoch_metrics
-    
+
+    def validate(self):
+        """Enhanced validation with proper metrics handling."""
+        self.model.eval()
+        val_metrics = {
+            'total_loss': 0.0,
+            'num_pos': 0
+        }
+        
+        predictions = []
+        targets = []
+        
+        with torch.no_grad():
+            pbar = tqdm(enumerate(self.val_dataloader), total=len(self.val_dataloader), 
+                    desc="Validation", leave=False)
+            
+            for batch_idx, batch in pbar:
+                images = batch['image'].to(self.device)
+                target_dict = {
+                    'boxes': batch['bbox'].to(self.device),
+                    'labels': batch['category'].to(self.device)
+                }
+                
+                # Forward pass
+                pred_cls, pred_reg, anchors = self.model(images)
+                loss_dict = self.loss_fn(pred_cls, pred_reg, anchors,
+                                    target_dict['labels'], target_dict['boxes'])
+                
+                # Update running metrics
+                val_metrics['total_loss'] += loss_dict['loss'].item()
+                val_metrics['num_pos'] += loss_dict['num_pos']
+                
+                # Store predictions and targets for metrics computation
+                predictions.append({
+                    'boxes': pred_reg,
+                    'scores': torch.sigmoid(pred_cls),  # Apply sigmoid for scores
+                    'labels': pred_cls.argmax(dim=-1)
+                })
+                targets.append(target_dict)
+                
+                pbar.set_postfix({'loss': f"{loss_dict['loss'].item():.4f}"})
+        
+        # Normalize metrics
+        num_batches = len(self.val_dataloader)
+        val_metrics['total_loss'] /= num_batches
+        
+        # Process metrics using your DetMetrics class
+        if hasattr(self, 'metrics'):
+            self.metrics.process(
+                tp=predictions,  
+                conf=torch.cat([p['scores'] for p in predictions]),
+                pred_cls=torch.cat([p['labels'] for p in predictions]),
+                target_cls=torch.cat([t['labels'] for t in targets])
+            )
+            val_metrics.update(self.metrics.results_dict)
+        
+        return val_metrics
+
+    def visualize_batch(self, images, pred_dist, pred_scores, target_bboxes, target_categories, batch_idx, epoch):
+        """
+        Visualize batch with predictions.
+
+        Args:
+            images (torch.Tensor): Batch of images
+            pred_dist (torch.Tensor): Predicted distributions
+            pred_scores (torch.Tensor): Predicted scores
+            target_bboxes (torch.Tensor): Target bounding boxes
+            target_categories (torch.Tensor): Target category labels
+            batch_idx (int): Batch index
+            epoch (int): Current epoch
+        """
+        save_dir = os.path.join(self.save_dir, 'visualizations', f'epoch_{epoch}')
+        os.makedirs(save_dir, exist_ok=True)
+        
+        from utils.visualization import plot_batch_predictions
+        
+        # Convert predictions to appropriate format
+        predictions = {
+            'pred_dist': pred_dist,
+            'pred_scores': pred_scores,
+        }
+        
+        targets = {
+            'boxes': target_bboxes,
+            'category': target_categories
+        }
+        
+        # Call plot_batch_predictions with correct arguments
+        plot_batch_predictions(
+            images=images,
+            predictions=predictions,
+            targets=targets,
+            save_dir=save_dir,
+            batch_idx=batch_idx
+        )
 
     def _initialize_csv(self):
         """Initialize the CSV log file with headers."""
@@ -253,22 +303,6 @@ class Trainer:
         if is_best:
             best_path = os.path.join(self.save_dir, 'best_model.pth')
             torch.save(checkpoint, best_path)
-
-    def visualize_batch(self, images, pred_dist, pred_scores, target_bboxes, 
-                       target_categories, batch_idx, epoch):
-        """Visualize batch with quaternion predictions."""
-        from utils.visualization import visualize_quaternion_predictions
-        
-        save_dir = os.path.join(self.save_dir, 'visualizations', f'epoch_{epoch}')
-        os.makedirs(save_dir, exist_ok=True)
-        
-        visualize_quaternion_predictions(
-            images=images.cpu(),
-            pred_dist=pred_dist.detach().cpu(),
-            pred_scores=pred_scores.detach().cpu(),
-            target_bboxes=target_bboxes.cpu(),
-            target_categories=target_categories.cpu(),
-        )
 
     def _log_metrics(self, epoch, metrics):
         """Log training metrics."""
