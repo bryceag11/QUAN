@@ -34,23 +34,23 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 #         return (k - 1) // 2
 #     return p
 
-class Conv(nn.Module):
-    default_act = nn.SiLU()  # default activation
+# class Conv(nn.Module):
+#     default_act = nn.SiLU()  # default activation
 
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        """Initialize Conv layer with given arguments including activation."""
-        super().__init__()
-        self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = IQBN(c2)
-        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+#         """Initialize Conv layer with given arguments including activation."""
+#         super().__init__()
+#         self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+#         self.bn = IQBN(c2)
+#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
-    def forward(self, x):
-        """Apply convolution, batch normalization and activation to input tensor."""
-        return self.act(self.bn(self.conv(x)))
+#     def forward(self, x):
+#         """Apply convolution, batch normalization and activation to input tensor."""
+#         return self.act(self.bn(self.conv(x)))
 
-    def forward_fuse(self, x):
-        """Apply convolution and activation without batch normalization."""
-        return self.act(self.conv(x))
+#     def forward_fuse(self, x):
+#         """Apply convolution and activation without batch normalization."""
+#         return self.act(self.conv(x))
 
 # Geometric
 # class QConv(nn.Module):
@@ -280,15 +280,15 @@ class QConv(nn.Module):
                           padding_mode, device=self.device, dtype=dtype).to(self.device)
         
         self.conv_i = Conv(actual_in_channels, out_channels_quat, kernel_size,
-                          stride, padding, dilation, groups, False, 
+                          stride, padding, dilation, groups, bias, 
                           padding_mode, device=self.device, dtype=dtype).to(self.device)
         
         self.conv_j = Conv(actual_in_channels, out_channels_quat, kernel_size,
-                          stride, padding, dilation, groups, False, 
+                          stride, padding, dilation, groups, bias, 
                           padding_mode, device=self.device, dtype=dtype).to(self.device)
         
         self.conv_k = Conv(actual_in_channels, out_channels_quat, kernel_size,
-                          stride, padding, dilation, groups, False, 
+                          stride, padding, dilation, groups, bias, 
                           padding_mode, device=self.device, dtype=dtype).to(self.device)
                           
         self._initialize_weights()
@@ -321,7 +321,6 @@ class QConv(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.to(self.device)
-        
         # Handle RGB input conversion for first layer
         if x.size(1) == 3:  # RGB input
             with torch.no_grad():  # Prevent memory accumulation during conversion
@@ -332,11 +331,15 @@ class QConv(nn.Module):
             assert Q == 4, "First layer input must have 4 quaternion components"
             
             # Process each component independently
-            with torch.set_grad_enabled(self.training):
-                r_conv = self.conv_r(x[:, 0:1])
-                i_conv = self.conv_i(x[:, 1:2])
-                j_conv = self.conv_j(x[:, 2:3])
-                k_conv = self.conv_k(x[:, 3:4])
+            # with torch.set_grad_enabled(self.training):
+            #     r_conv = self.conv_r(x[:, 0:1])
+            #     i_conv = self.conv_i(x[:, 1:2])
+            #     j_conv = self.conv_j(x[:, 2:3])
+            #     k_conv = self.conv_k(x[:, 3:4])
+            r_conv = self.conv_r(x[:, 0:1])
+            i_conv = self.conv_i(x[:, 1:2])
+            j_conv = self.conv_j(x[:, 2:3])
+            k_conv = self.conv_k(x[:, 3:4])
         else:
             # For subsequent layers, input shape is [B, C, Q, H, W]
             x_r = x[:, :, 0, :, :]  # shape: [B, C_q, H, W]
@@ -345,11 +348,11 @@ class QConv(nn.Module):
             x_k = x[:, :, 3, :, :]
             
             # Independent convolutions for each component
-            with torch.set_grad_enabled(self.training):
-                r_conv = self.conv_r(x_r)
-                i_conv = self.conv_i(x_i)
-                j_conv = self.conv_j(x_j)
-                k_conv = self.conv_k(x_k)
+            # with torch.set_grad_enabled(self.training):
+            r_conv = self.conv_r(x_r)
+            i_conv = self.conv_i(x_i)
+            j_conv = self.conv_j(x_j)
+            k_conv = self.conv_k(x_k)
         
         # Hamilton product mixing - same for both cases
         # Use in-place operations where possible
@@ -488,7 +491,8 @@ class QConv2D(QConv):
                  bias: bool = True,
                  padding_mode: str = 'zeros',
                  device=None,
-                 dtype=None) -> None:
+                 dtype=None,
+                 mapping_type: str = 'raw_normalized') -> None:
         super().__init__(
             rank=2,  # Fixed for 2D convolution
             in_channels=in_channels,
@@ -501,7 +505,8 @@ class QConv2D(QConv):
             bias=bias,
             padding_mode=padding_mode,
             device=device,
-            dtype=dtype
+            dtype=dtype,
+            mapping_type=mapping_type
         )
 
 
@@ -540,7 +545,7 @@ class QDense(nn.Module):
                  in_features: int, 
                  out_features: int, 
                  bias: bool = True,
-                 mapping_type: str = 'luminance',
+                 mapping_type: str = 'raw_normalized',
                  device=None,
                  dtype=None):
         super(QDense, self).__init__()

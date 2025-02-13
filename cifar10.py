@@ -77,7 +77,7 @@ def count_parameters(model):
 
 
 # Configuration
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 NUM_CLASSES = 10
 EPOCHS = 300
 LEARNING_RATE = 0.001
@@ -360,7 +360,7 @@ class QResNet34(nn.Module):
     """
     Quaternion ResNet34 implementation exactly matching the paper's architecture
     """
-    def __init__(self, num_classes=10, mapping_type='poincare'):
+    def __init__(self, num_classes=10, mapping_type='raw_normalized'):
         super().__init__()
         
         self.dropout_rates = {
@@ -448,7 +448,6 @@ class QResNet34(nn.Module):
     def forward(self, x):
         # Initial conv
         x = self.conv1(x)
-        
         # Residual blocks
         x = self.conv2_x(x)  # [3 × 32 × 32 × 16]
         x = self.conv3_x(x)  # [3 × 16 × 16 × 32]
@@ -770,7 +769,7 @@ def main():
     
     train_loader, test_loader = get_data_loaders()
     
-    model = QResNet34(num_classes=10, mapping_type='poincare').to(DEVICE)
+    model = QResNet34(num_classes=10, mapping_type='raw_normalized').to(DEVICE)
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
@@ -783,26 +782,26 @@ def main():
                             nesterov=True)
     
 
-    class WarmupMultiStepLR(torch.optim.lr_scheduler._LRScheduler):
-        def __init__(self, optimizer, milestones, gamma=0.2, warmup_epochs=5, warmup_factor=0.1,
-                    last_epoch=-1):
-            self.milestones = milestones
-            self.gamma = gamma
-            self.warmup_epochs = warmup_epochs
-            self.warmup_factor = warmup_factor
-            super().__init__(optimizer, last_epoch)
-        def get_lr(self):
-            if self.last_epoch < self.warmup_epochs:
-                # Linear warmup
-                alpha = self.last_epoch / self.warmup_epochs
-                warmup_factor = self.warmup_factor * (1 - alpha) + alpha
-                return [base_lr * warmup_factor for base_lr in self.base_lrs]
-            else:
-                # Regular MultiStepLR behavior
-                return [base_lr * self.gamma ** len([m for m in self.milestones if m <= self.last_epoch])
-                        for base_lr in self.base_lrs]
-        def is_milestone(self, epoch):
-            return epoch in self.milestones
+    # class WarmupMultiStepLR(torch.optim.lr_scheduler._LRScheduler):
+    #     def __init__(self, optimizer, milestones, gamma=0.2, warmup_epochs=5, warmup_factor=0.1,
+    #                 last_epoch=-1):
+    #         self.milestones = milestones
+    #         self.gamma = gamma
+    #         self.warmup_epochs = warmup_epochs
+    #         self.warmup_factor = warmup_factor
+    #         super().__init__(optimizer, last_epoch)
+    #     def get_lr(self):
+    #         if self.last_epoch < self.warmup_epochs:
+    #             # Linear warmup
+    #             alpha = self.last_epoch / self.warmup_epochs
+    #             warmup_factor = self.warmup_factor * (1 - alpha) + alpha
+    #             return [base_lr * warmup_factor for base_lr in self.base_lrs]
+    #         else:
+    #             # Regular MultiStepLR behavior
+    #             return [base_lr * self.gamma ** len([m for m in self.milestones if m <= self.last_epoch])
+    #                     for base_lr in self.base_lrs]
+    #     def is_milestone(self, epoch):
+    #         return epoch in self.milestones
         # def get_lr(self):
         #     if self.last_epoch < self.warmup_epochs:
         #         # Linear warmup
@@ -832,12 +831,10 @@ def main():
 # )
     l1_reg = L1Regularization(L1_REG)
     
-    scheduler = WarmupMultiStepLR(
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[75, 150, 225],
-        gamma=0.1,
-        warmup_epochs=5,
-        warmup_factor=0.1
+        milestones=[150, 225],
+        gamma=0.2,
     )
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

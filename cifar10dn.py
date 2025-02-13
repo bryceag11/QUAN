@@ -266,7 +266,263 @@ class QuaternionResNet(nn.Module):
         batch_size = x.size(0)
         x = x.view(batch_size, -1, 4)  # [B, num_classes, 4]
         return x[:, :, 0]  # Return real component [B, num_classes]
+
+class QuaternionBottleneck(nn.Module):
+    """
+    Bottleneck block for QResNet-50 with quaternion convolutions
+    Expansion factor is 4 as in original ResNet
+    """
+    expansion: int = 4
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        dropout_rate: float = 0.0,
+        downsample: Union[nn.Module, None] = None
+    ) -> None:
+        super().__init__()
         
+        # First 1x1 conv reduces channels
+        self.conv1 = QConv2D(in_channels, out_channels, kernel_size=1, stride=1, bias=False)
+        self.bn1 = IQBN(out_channels)
+        
+        # 3x3 conv keeps same number of channels
+        self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3, 
+                            stride=stride, padding=1, bias=False)
+        self.bn2 = IQBN(out_channels)
+        
+        # Last 1x1 conv increases channels by expansion factor
+        self.conv3 = QConv2D(out_channels, out_channels * self.expansion, 
+                            kernel_size=1, bias=False)
+        self.bn3 = IQBN(out_channels * self.expansion)
+        
+        self.relu = nn.SiLU()  # Using SiLU as in the original implementation
+        self.downsample = downsample
+        self.stride = stride
+        
+        # Dropout layers
+        self.dropout1 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+        self.dropout2 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+        self.dropout3 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        identity = x
+
+        # First bottleneck block
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout1(out)
+
+        # Second block with stride
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.dropout2(out)
+
+        # Third block expands channels
+        out = self.conv3(out)
+        out = self.bn3(out)
+        out = self.dropout3(out)
+
+        # Handle shortcut connection
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+class QResNet50(nn.Module):
+    """
+    Quaternion ResNet-50 implementation with dynamic dropout
+    """
+    def __init__(self, num_classes: int = 10, mapping_type: str = 'raw_normalized'):
+        super().__init__()
+        
+        # Initial dropout rates for different stages
+        self.dropout_rates = {
+            'initial': [0.1, 0.15, 0.2, 0.25, 0.3],  # [stage2, stage3, stage4, stage5, classifier]
+            'increment': 0.05  # Amount to increase after each LR drop
+        }
+        self.current_rates = self.dropout_rates['initial'].copy()
+        
+        # Initial convolution layer
+        self.conv1 = nn.Sequential(
+            QConv2D(in_channels=3, out_channels=64, kernel_size=3, 
+                   stride=1, padding=1, mapping_type=mapping_type),
+            IQBN(64),
+            nn.SiLU()
+        )
+        
+        # ResNet stages
+        self.stage2 = self._make_layer(64, 64, blocks=3, stride=1, dropout_idx=0)
+        self.stage3 = self._make_layer(256, 128, blocks=4, stride=2, dropout_idx=1)
+        self.stage4 = self._make_layer(512, 256, blocks=6, stride=2, dropout_idx=2)
+        self.stage5 = self._make_layer(1024, 512, blocks=3, stride=2, dropout_idx=3)
+        
+        # Global Average Pooling and Classifier
+        self.avgpool = QuaternionAvgPool()
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            QDense(2048, 512),  # 2048 due to expansion factor of 4
+            nn.ReLU(),
+            nn.Dropout(p=self.current_rates[4]),
+            QDense(512, num_classes * 4)
+        )
+
+    def _make_layer(
+        self, 
+        in_channels: int,
+        out_channels: int,
+        blocks: int,
+        stride: int = 1,
+        dropout_idx: int = 0
+    ) -> nn.Sequential:
+        downsample = None
+        
+        # Handle dimension changes
+        if stride != 1 or in_channels != out_channels * QuaternionBottleneck.expansion:
+            downsample = nn.Sequential(
+                QConv2D(in_channels, out_channels * QuaternionBottleneck.expansion,
+                       kernel_size=1, stride=stride, bias=False),
+                IQBN(out_channels * QuaternionBottleneck.expansion)
+            )
+
+        layers = []
+        # First block handles stride and channel changes
+        layers.append(
+            QuaternionBottleneck(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                dropout_rate=self.current_rates[dropout_idx],
+                downsample=downsample
+            )
+        )
+        
+        # Remaining blocks
+        in_channels = out_channels * QuaternionBottleneck.expansion
+        for _ in range(1, blocks):
+            layers.append(
+                QuaternionBottleneck(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    dropout_rate=self.current_rates[dropout_idx]
+                )
+            )
+
+        return nn.Sequential(*layers)
+
+    def update_dropout_rates(self):
+        """Increase dropout rates by the increment amount"""
+        for i in range(len(self.current_rates)):
+            self.current_rates[i] = min(0.5, self.current_rates[i] + self.dropout_rates['increment'])
+            
+        # Update dropout in all stages
+        self._update_stage_dropout(self.stage2, 0)
+        self._update_stage_dropout(self.stage3, 1)
+        self._update_stage_dropout(self.stage4, 2)
+        self._update_stage_dropout(self.stage5, 3)
+        
+        # Update classifier dropout
+        if isinstance(self.classifier[3], nn.Dropout):
+            self.classifier[3].p = self.current_rates[4]
+
+    def _update_stage_dropout(self, stage, rate_idx):
+        """Update dropout rates in a stage"""
+        for layer in stage:
+            if isinstance(layer, QuaternionBottleneck):
+                layer.dropout1.p = self.current_rates[rate_idx]
+                layer.dropout2.p = self.current_rates[rate_idx]
+                layer.dropout3.p = self.current_rates[rate_idx]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Initial convolution
+        x = self.conv1(x)
+        
+        # ResNet stages
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.stage5(x)
+        
+        # Global average pooling
+        x = self.avgpool(x)
+        
+        # Classification
+        x = self.classifier(x)
+        
+        # Extract real components for final output
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1, 4)  # Reshape to separate quaternion components
+        real_components = x[:, :, 0]  # Take only real part [batch_size, num_classes]
+        
+        return real_components
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        random_tensor.floor_()  # binarize
+        output = x.div(keep_prob) * random_tensor
+        return output
+
+class ModernQuaternionBottleneck(nn.Module):
+    """Modern bottleneck block with improved techniques"""
+    expansion = 4
+
+    def __init__(self, in_channels, out_channels, stride=1, downsample=None, drop_path=0.):
+        super().__init__()
+        
+        # Pre-norm design
+        self.bn1 = IQBN(in_channels)
+        self.conv1 = QConv2D(in_channels, out_channels, kernel_size=1, bias=False)
+        
+        self.bn2 = IQBN(out_channels)
+        self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3, 
+                            stride=stride, padding=1, bias=False)
+        
+        self.bn3 = IQBN(out_channels)
+        self.conv3 = QConv2D(out_channels, out_channels * self.expansion, kernel_size=1, bias=False)
+        
+        self.relu = nn.SiLU(inplace=True)
+        self.downsample = downsample
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        identity = x
+
+        # Pre-norm
+        out = self.bn1(x)
+        out = self.relu(out)
+        out = self.conv1(out)
+        
+        out = self.bn2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        
+        out = self.bn3(out)
+        out = self.relu(out)
+        out = self.conv3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out = self.drop_path(out)
+        out += identity
+        return out
 
 
 class QuaternionAvgPool(nn.Module):
@@ -318,7 +574,7 @@ class QuaternionBasicBlock(nn.Module):
         self.conv1 = QConv2D(in_channels, out_channels, kernel_size=3, 
                             stride=stride, padding=1)
         self.bn1 = IQBN(out_channels)
-        self.relu = QPReLU()
+        self.relu = nn.SiLU()
 
         self.dropout1 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
 
@@ -354,13 +610,17 @@ class QuaternionBasicBlock(nn.Module):
         out += identity
         return out
 
+#TODO implement unitary L1 reg
+'''
+Removing weights simultaneously vs four components independently
+'''
 
 
 class QResNet34(nn.Module):
     """
     Quaternion ResNet34 implementation exactly matching the paper's architecture
     """
-    def __init__(self, num_classes=10):
+    def __init__(self, num_classes=10, mapping_type='raw_normalized'):
         super().__init__()
         
         self.dropout_rates = {
@@ -373,7 +633,7 @@ class QResNet34(nn.Module):
         self.conv1 = nn.Sequential(
             QConv2D(in_channels=3, out_channels=64, kernel_size=3, stride=1, padding=1),
             IQBN(64),
-            QPReLU()
+            nn.SiLU()
         )
         
         self.conv2_x = self._make_layer(64, 64, 3, 1,  dropout_idx=0)
@@ -728,8 +988,8 @@ def train_epoch(model, train_loader, criterion, optimizer, l1_reg, epoch):
         
         outputs = model(inputs)
         criterion_loss = criterion(outputs, targets)
-        # l1_loss = l1_reg(model)
-        total_loss = criterion_loss 
+        l1_loss = l1_reg(model)
+        total_loss = criterion_loss + l1_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
@@ -768,16 +1028,16 @@ def main():
     
     train_loader, test_loader = get_data_loaders()
     
-    model = QResNet34(num_classes=10).to(DEVICE)
+    model = ModernQResNet().cuda()
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=.1)
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), 
                             lr=0.1,
                             momentum=0.9, 
-                            weight_decay=5e-4,
+                            weight_decay=1e-4,
                             nesterov=True)
     
 
@@ -813,7 +1073,7 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[75, 125, 175, 225],  # Push milestones later to allow better initial training
+        milestones=[150, 225],  # Push milestones later to allow better initial training
         gamma=0.1  # More gentle drops
 )
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(

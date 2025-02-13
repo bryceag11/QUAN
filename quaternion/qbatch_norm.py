@@ -279,70 +279,73 @@ class QBN(nn.Module):
         x_out[:, :, 1:] = x_out[:, :, 1:] + self.beta.view(1, 1, 3, 1, 1)
         
         return x_out
-    
-    
 
 class IQBN(nn.Module):
-    """Quaternion Batch Normalization with careful running stats management"""
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
-        self.num_features = num_features
+        # Adjust features for quaternion structure
+        self.num_features = num_features // 4
         self.eps = eps
         self.momentum = momentum
 
-        # Parameters will be created dynamically
-        self.gamma = None
-        self.beta = None
+        # Create parameters
+        self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
+        self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
         
-        # Don't initialize running stats here - will be done in forward
-        self.running_mean = None
-        self.running_var = None
+        # Register buffers with correct shapes
+        self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
+        self.register_buffer('running_var', torch.ones(self.num_features, 4))
+        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
         B, C, Q, H, W = x.shape
         assert Q == 4, "Expected quaternion input with 4 components"
+        assert C == self.num_features, f"Expected {self.num_features} quaternion channels, got {C}"
 
-        # Dynamically create parameters if not already created
-        if self.gamma is None:
-            self.gamma = nn.Parameter(torch.ones(C, 4).to(x.device))
-            self.beta = nn.Parameter(torch.zeros(C, 4).to(x.device))
-            
-            # Initialize running stats
-            self.running_mean = torch.zeros(C, 4).to(x.device)
-            self.running_var = torch.ones(C, 4).to(x.device)
-
-        # Reshape input for efficient stats computation
-        x_reshaped = x.reshape(B, C, Q, -1)  # [B, C, Q, H*W]
-
+        # Move buffers to same device as input
+        device = x.device
+        self.running_mean = self.running_mean.to(device)
+        self.running_var = self.running_var.to(device)
+        self.num_batches_tracked = self.num_batches_tracked.to(device)
+        
+        # Flatten spatial dimensions for stats computation
+        x_reshaped = x.transpose(1, 2).reshape(B, Q, C, -1)  # [B, Q, C, H*W]
+        
         if self.training:
-            # Compute mean and var efficiently
-            mean = x_reshaped.mean(dim=(0, -1))    # [C, Q]
-            var = x_reshaped.var(dim=(0, -1))      # [C, Q]
-
-            # Update running stats
-            with torch.no_grad():
-                if self.running_mean is None:
-                    self.running_mean = mean.clone()
-                    self.running_var = var.clone()
-                else:
-                    self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean
-                    self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var
+            # Compute stats per channel and quaternion component
+            mean = x_reshaped.mean(dim=(0, -1))  # [Q, C]
+            var = x_reshaped.var(dim=(0, -1), unbiased=False)  # [Q, C]
+            
+            if self.num_batches_tracked == 0:
+                # Initialize running stats on first batch
+                self.running_mean.copy_(mean.t().detach())
+                self.running_var.copy_(var.t().detach())
+            else:
+                # Update running stats
+                self.running_mean.mul_(1 - self.momentum).add_(mean.t().detach() * self.momentum)
+                self.running_var.mul_(1 - self.momentum).add_(var.t().detach() * self.momentum)
+            
+            self.num_batches_tracked += 1
         else:
-            mean = self.running_mean
-            var = self.running_var
+            mean = self.running_mean.t()  # [Q, C]
+            var = self.running_var.t()  # [Q, C]
 
-        # Reshape stats for broadcasting
-        mean = mean.reshape(1, C, Q, 1, 1)
-        var = var.reshape(1, C, Q, 1, 1)
-        gamma = self.gamma.reshape(1, C, Q, 1, 1)
-        beta = self.beta.reshape(1, C, Q, 1, 1)
+        # Reshape stats for normalization
+        mean = mean.view(1, Q, C, 1)  # [1, Q, C, 1]
+        var = var.view(1, Q, C, 1)  # [1, Q, C, 1]
+        
+        # Normalize while preserving quaternion structure
+        x_norm = (x_reshaped - mean) / (var + self.eps).sqrt()
+        
+        # Apply learnable parameters (ensure they're on correct device)
+        gamma = self.gamma.to(device).t().view(1, Q, C, 1)  # [1, Q, C, 1]
+        beta = self.beta.to(device).t().view(1, Q, C, 1)  # [1, Q, C, 1]
+        x_norm = x_norm * gamma + beta
+        
+        # Restore original shape
+        return x_norm.reshape(B, Q, C, H, W).transpose(1, 2)
 
-        # Normalize
-        x_normalized = (x - mean) / (var + self.eps).sqrt_()
-        x_normalized.mul_(gamma)
-        x_normalized.add_(beta)
-        return x_normalized
-    
+
 
 
 # class IQBN(nn.Module):
