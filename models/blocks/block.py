@@ -8,9 +8,29 @@ from quaternion.conv import QConv, QConv1D, QConv2D, QConv3D, Conv
 from quaternion.qactivation import QHardTanh, QLeakyReLU, QuaternionActivation, QReLU, QPReLU, QREReLU, QSigmoid, QTanh
 from quaternion.qbatch_norm import QBN, IQBN, VQBN
 from typing import List
-from cifar10 import QuaternionMaxPool
 import math
 
+
+class DFL(nn.Module):
+    """
+    Integral module of Distribution Focal Loss (DFL).
+
+    Proposed in Generalized Focal Loss https://ieeexplore.ieee.org/document/9792391
+    """
+
+    def __init__(self, c1=16):
+        """Initialize a convolutional layer with a given number of input channels."""
+        super().__init__()
+        self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
+        x = torch.arange(c1, dtype=torch.float)
+        self.conv.weight.data[:] = nn.Parameter(x.view(1, c1, 1, 1))
+        self.c1 = c1
+
+    def forward(self, x):
+        """Applies a transformer layer on input tensor 'x' and returns a tensor."""
+        b, _, a = x.shape  # batch, channels, anchors
+        return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
+        # return self.conv(x.view(b, self.c1, 4, a).softmax(1)).view(b, 4, a)
 
 class QuaternionPolarPool(nn.Module):
     """
@@ -63,7 +83,25 @@ class QuaternionPolarPool(nn.Module):
         
         return pooled.view(B, C, Q, pooled.shape[2], pooled.shape[3])  # [B, C, 4, H', W']
 
-
+class QuaternionMaxPool(nn.Module):
+    """Quaternion-aware max pooling"""
+    def __init__(self, kernel_size=2, stride=2, padding=0):
+        super().__init__()
+        self.pool = nn.MaxPool2d(kernel_size=kernel_size, stride=stride, padding=padding)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, Q, H, W = x.shape
+        assert Q == 4, "Expected quaternion format with 4 components"
+        
+        # Reshape to (B * Q, C, H, W) for spatial pooling
+        x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * Q, C, H, W)
+        
+        # Apply pooling
+        pooled = self.pool(x_reshaped)
+        
+        # Reshape back to (B, C, 4, H_out, W_out)
+        H_out, W_out = pooled.shape[-2:]
+        return pooled.view(B, Q, C, H_out, W_out).permute(0, 2, 1, 3, 4)
 
 class InformationTheoreticQuaternionPool(nn.Module):
     """
@@ -180,10 +218,6 @@ class SPPF(nn.Module):
         y = torch.cat(pooled_outputs, dim=1)  # Shape: (B, c_ * 4, 4, H, W)
         y = self.cv2(y)  # Project to out_channels: (B, out_channels, 4, H, W)
         return y
-
-
-
-
 
 
 class C3k2(nn.Module):

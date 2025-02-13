@@ -162,34 +162,6 @@ class MetricsLogger:
         plt.savefig(self.save_dir / save_path)
         plt.close()
 
-class QuaternionDropout(nn.Module):
-    """
-    Applies the same dropout mask across all four components of a quaternion tensor.
-    
-    Args:
-        p (float): Probability of an element to be zeroed. Default: 0.5.
-    """
-    def __init__(self, p=0.5):
-        super(QuaternionDropout, self).__init__()
-        self.p = p
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p == 0.0:
-            return x  # No dropout during evaluation or if p=0
-        
-        B, C, Q, H, W = x.shape
-        assert Q == 4, "Expected quaternion format with 4 components."
-        
-        # Generate dropout mask for one quaternion component (shape: B, C, H, W)
-        mask = torch.rand(B, C, H, W, device=x.device, dtype=x.dtype) > self.p
-        
-        # Expand mask to all quaternion components (shape: B, C, 4, H, W)
-        mask = mask.unsqueeze(2).expand(B, C, Q, H, W)
-        
-        # Apply mask and scale the output
-        return x * mask / (1 - self.p)
-
-
 class QuaternionResNet(nn.Module):
     """Deeper ResNet-style architecture with quaternion convolutions based on the paper's implementation"""
     def __init__(self, num_classes=10, mapping_type='luminance'):
@@ -523,6 +495,35 @@ class ModernQuaternionBottleneck(nn.Module):
         out = self.drop_path(out)
         out += identity
         return out
+
+
+
+class QuaternionDropout(nn.Module):
+    """
+    Applies the same dropout mask across all four components of a quaternion tensor.
+    
+    Args:
+        p (float): Probability of an element to be zeroed. Default: 0.5.
+    """
+    def __init__(self, p=0.5):
+        super(QuaternionDropout, self).__init__()
+        self.p = p
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x  # No dropout during evaluation or if p=0
+        
+        B, C, Q, H, W = x.shape
+        assert Q == 4, "Expected quaternion format with 4 components."
+        
+        # Generate dropout mask for one quaternion component (shape: B, C, H, W)
+        mask = torch.rand(B, C, H, W, device=x.device, dtype=x.dtype) > self.p
+        
+        # Expand mask to all quaternion components (shape: B, C, 4, H, W)
+        mask = mask.unsqueeze(2).expand(B, C, Q, H, W)
+        
+        # Apply mask and scale the output
+        return x * mask / (1 - self.p)
 
 
 class QuaternionAvgPool(nn.Module):

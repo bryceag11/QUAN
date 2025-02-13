@@ -7,7 +7,7 @@ import numpy as np
 from typing import Union, Tuple, List, Optional
 import math
 from .qbatch_norm import QBN, IQBN
-__all__ = ['QConv', 'QConv1D', 'QConv2D',
+__all__ = ['Conv', 'DWConv', 'QConv', 'QConv1D', 'QConv2D',
            'QConv3D', 'QDense', 'QInit']
 
 
@@ -34,24 +34,31 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 #         return (k - 1) // 2
 #     return p
 
-# class Conv(nn.Module):
-#     default_act = nn.SiLU()  # default activation
+class Conv(nn.Module):
+    default_act = nn.SiLU()  # default activation
 
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         """Initialize Conv layer with given arguments including activation."""
-#         super().__init__()
-#         self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-#         self.bn = IQBN(c2)
-#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize Conv layer with given arguments including activation."""
+        super().__init__()
+        self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = IQBN(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
-#     def forward(self, x):
-#         """Apply convolution, batch normalization and activation to input tensor."""
-#         return self.act(self.bn(self.conv(x)))
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor."""
+        # print(f"X type: {x.dtype}")
+        return self.act(self.bn(self.conv(x)))
 
-#     def forward_fuse(self, x):
-#         """Apply convolution and activation without batch normalization."""
-#         return self.act(self.conv(x))
+    def forward_fuse(self, x):
+        """Apply convolution and activation without batch normalization."""
+        return self.act(self.conv(x))
 
+class DWConv(Conv):
+    """Depth-wise convolution."""
+
+    def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
+        """Initialize Depth-wise convolution with given parameters."""
+        super().__init__(c1, c2, k, s, g=math.gcd(c1//4, c2//4), d=d, act=act)
 # Geometric
 # class QConv(nn.Module):
 #     def __init__(self, 
@@ -320,7 +327,9 @@ class QConv(nn.Module):
             nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i+1])
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # print("X type:", x.dtype)
         x = x.to(self.device)
+        # print(f"Weight dtype: {self.conv_r.weight.dtype}")
         # Handle RGB input conversion for first layer
         if x.size(1) == 3:  # RGB input
             with torch.no_grad():  # Prevent memory accumulation during conversion
@@ -331,11 +340,6 @@ class QConv(nn.Module):
             assert Q == 4, "First layer input must have 4 quaternion components"
             
             # Process each component independently
-            # with torch.set_grad_enabled(self.training):
-            #     r_conv = self.conv_r(x[:, 0:1])
-            #     i_conv = self.conv_i(x[:, 1:2])
-            #     j_conv = self.conv_j(x[:, 2:3])
-            #     k_conv = self.conv_k(x[:, 3:4])
             r_conv = self.conv_r(x[:, 0:1])
             i_conv = self.conv_i(x[:, 1:2])
             j_conv = self.conv_j(x[:, 2:3])
@@ -348,7 +352,6 @@ class QConv(nn.Module):
             x_k = x[:, :, 3, :, :]
             
             # Independent convolutions for each component
-            # with torch.set_grad_enabled(self.training):
             r_conv = self.conv_r(x_r)
             i_conv = self.conv_i(x_i)
             j_conv = self.conv_j(x_j)
@@ -447,6 +450,36 @@ class QConv(nn.Module):
         
         return mappings[self.mapping_type]
 
+class QConv2D(QConv):
+    """2D Quaternion Convolution layer."""
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int, int]],
+                 stride: Union[int, Tuple[int, int]] = 1,
+                 padding: Union[str, int, Tuple[int, int]] = 0,
+                 dilation: Union[int, Tuple[int, int]] = 1,
+                 groups: int = 1,
+                 bias: bool = True,
+                 padding_mode: str = 'zeros',
+                 device=None,
+                 dtype=None) -> None:
+        super().__init__(
+            rank=2,  # Fixed for 2D convolution
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+            padding_mode=padding_mode,
+            device=device,
+            dtype=dtype
+        )
+
+
 class QConv1D(QConv):
     """1D Quaternion Convolution layer."""
     def __init__(self,
@@ -476,38 +509,6 @@ class QConv1D(QConv):
             dtype=dtype
         )
 
-
-
-class QConv2D(QConv):
-    """2D Quaternion Convolution layer."""
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 kernel_size: Union[int, Tuple[int, int]],
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[str, int, Tuple[int, int]] = 0,
-                 dilation: Union[int, Tuple[int, int]] = 1,
-                 groups: int = 1,
-                 bias: bool = True,
-                 padding_mode: str = 'zeros',
-                 device=None,
-                 dtype=None,
-                 mapping_type: str = 'raw_normalized') -> None:
-        super().__init__(
-            rank=2,  # Fixed for 2D convolution
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias,
-            padding_mode=padding_mode,
-            device=device,
-            dtype=dtype,
-            mapping_type=mapping_type
-        )
 
 
 class QConv3D(QConv):

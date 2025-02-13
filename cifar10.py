@@ -22,6 +22,7 @@ import signal
 import sys
 import gc
 from typing import OrderedDict
+import math 
 
 def handle_keyboard_interrupt(signum, frame):
     """
@@ -189,91 +190,12 @@ class QuaternionDropout(nn.Module):
         # Apply mask and scale the output
         return x * mask / (1 - self.p)
 
-
-class QuaternionResNet(nn.Module):
-    """Deeper ResNet-style architecture with quaternion convolutions based on the paper's implementation"""
-    def __init__(self, num_classes=10, mapping_type='luminance'):
-        super(QuaternionResNet, self).__init__()
-        
-        # Initial convolution layer - matches Conv1 from Table II
-        self.conv1 = nn.Sequential(
-            QConv2D(3, 16, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
-            IQBN(16),
-            nn.ReLU(inplace=True)
-        )
-        
-        # Conv2_x block - 3 residual blocks (16 channels)
-        self.conv2_x = self._make_layer(16, 16, blocks=3, stride=1, mapping_type=mapping_type)
-        
-        # Conv3_x block - 4 residual blocks (32 channels)
-        self.conv3_x = self._make_layer(16, 32, blocks=4, stride=2, mapping_type=mapping_type)
-        
-        # Conv4_x block - 6 residual blocks (64 channels)
-        self.conv4_x = self._make_layer(32, 64, blocks=6, stride=2, mapping_type=mapping_type)
-        
-        # Conv5_x block - 3 residual blocks (128 channels)
-        self.conv5_x = self._make_layer(64, 128, blocks=3, stride=2, mapping_type=mapping_type)
-        
-        # Quaternion-aware global average pooling
-        self.avg_pool = QuaternionAvgPool()
-        
-        # Dropout for regularization
-        self.dropout = nn.Dropout(0.2)
-        
-        # Final fully connected layer
-        self.fc = QDense(128, num_classes * 4, mapping_type=mapping_type)
-
-    def _make_layer(self, in_channels, out_channels, blocks, stride, mapping_type):
-        """Create a layer of residual blocks"""
-        layers = []
-        
-        # First block handles stride and channel changes
-        layers.append(QuaternionBasicBlock(in_channels, out_channels, stride, mapping_type))
-        
-        # Remaining blocks
-        for _ in range(1, blocks):
-            layers.append(QuaternionBasicBlock(out_channels, out_channels, 1, mapping_type))
-            
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        # Initial convolution
-        x = self.conv1(x)
-        
-        # Residual blocks
-        x = self.conv2_x(x)  # 3 blocks
-        x = self.conv3_x(x)  # 4 blocks
-        x = self.conv4_x(x)  # 6 blocks
-        x = self.conv5_x(x)  # 3 blocks
-        
-        # Global average pooling
-        x = self.avg_pool(x)
-        
-        # Dropout
-        x = self.dropout(x)
-        
-        # Flatten
-        x = x.permute(0, 2, 1, 3, 4).contiguous()  # [B, 4, 32, 1, 1]
-        x = x.view(x.size(0), 4, -1)  # [B, 4, 32]
-        x = x.permute(0, 2, 1).contiguous()  # [B, 32, 4]
-        x = x.reshape(x.size(0), -1)  # [B, 128]
-        
-        # Two options for classification:
-        # Option 1: Using QDense (maintain quaternion structure)
-        x = self.fc(x)  # QDense output: [B, num_classes * 4]
-        
-        # Reshape to quaternion format and take real part
-        batch_size = x.size(0)
-        x = x.view(batch_size, -1, 4)  # [B, num_classes, 4]
-        return x[:, :, 0]  # Return real component [B, num_classes]
-        
-
-
 class QuaternionAvgPool(nn.Module):
     """Quaternion-aware average pooling"""
-    def __init__(self):
+    def __init__(self, kernel_size=None, stride=None):
         super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.kernel_size = kernel_size
+        self.stride = stride
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, Q, H, W = x.shape
@@ -283,10 +205,19 @@ class QuaternionAvgPool(nn.Module):
         x_reshaped = x.permute(0, 2, 1, 3, 4).reshape(B * Q, C, H, W)
         
         # Apply pooling
-        pooled = self.avg_pool(x_reshaped)
+        if self.kernel_size is None:
+            # Global average pooling
+            pooled = F.adaptive_avg_pool2d(x_reshaped, (1, 1))
+        else:
+            # Strided pooling
+            pooled = F.avg_pool2d(x_reshaped, 
+                                kernel_size=self.kernel_size,
+                                stride=self.stride)
         
-        # Reshape back to (B, C, 4, H_out, W_out)
+        # Get output dimensions
         H_out, W_out = pooled.shape[-2:]
+        
+        # Reshape back to quaternion format (B, C, 4, H_out, W_out)
         return pooled.view(B, Q, C, H_out, W_out).permute(0, 2, 1, 3, 4)
 
 class QuaternionMaxPool(nn.Module):
@@ -309,52 +240,137 @@ class QuaternionMaxPool(nn.Module):
         H_out, W_out = pooled.shape[-2:]
         return pooled.view(B, Q, C, H_out, W_out).permute(0, 2, 1, 3, 4)
 
-class QuaternionBasicBlock(nn.Module):
-    """Enhanced residual block for quaternion networks"""
-    def __init__(self, in_channels, out_channels, stride=1, mapping_type='poincare', dropout_rate=0.0):
-        super(QuaternionBasicBlock, self).__init__()
-        
-        # First convolution block
-        self.conv1 = QConv2D(in_channels, out_channels, kernel_size=3, 
-                            stride=stride, padding=1, mapping_type=mapping_type)
-        self.bn1 = IQBN(out_channels)
+class BasicBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, dropRate=0.0):
+        super(BasicBlock, self).__init__()
+        self.bn1 = IQBN(in_planes)
         self.relu = QPReLU()
+        self.conv1 = QConv2D(in_planes, out_planes, kernel_size=3, stride=1,
+                           padding=1, bias=False)
+        self.droprate = dropRate
+    def forward(self, x):
+        out = self.conv1(self.relu(self.bn1(x)))
+        if self.droprate > 0:
+            out = F.dropout(out, p=self.droprate, training=self.training)
+        return torch.cat([x, out], 1)
 
-        self.dropout1 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+class BottleneckBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, dropRate=0.0):
+        super(BottleneckBlock, self).__init__()
+        inter_planes = out_planes * 4
+        self.bn1 = IQBN(in_planes)
+        self.relu = QPReLU
+        self.conv1 = QConv2D(in_planes, inter_planes, kernel_size=1, stride=1,
+                           padding=0, bias=False)
+        self.bn2 = IQBN(inter_planes)
+        self.conv2 = QConv2D(inter_planes, out_planes, kernel_size=3, stride=1,
+                           padding=1, bias=False)
+        self.droprate = dropRate
+    def forward(self, x):
+        out = self.conv1(self.relu(self.bn1(x)))
+        if self.droprate > 0:
+            out = QuaternionDropout(p=self.droprate)(out)
+        out = self.conv2(self.relu(self.bn2(out)))
+        if self.droprate > 0:
+            out = QuaternionDropout(p=self.droprate)(out)
+        return torch.cat([x, out], 1)
 
-        # Second convolution block
-        self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3,
-                            stride=1, padding=1, mapping_type=mapping_type)
-        self.bn2 = IQBN(out_channels)
+class TransitionBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, dropRate=0.0):
+        super(TransitionBlock, self).__init__()
+        self.bn1 = IQBN(in_planes)
+        self.relu = QPReLU()
+        self.conv1 = QConv2D(in_planes, out_planes, kernel_size=1, stride=1,
+                           padding=0, bias=False)
+        self.droprate = dropRate
+        self.pool = QuaternionAvgPool(kernel_size=2, stride=2)
+    def forward(self, x):
+        out = self.conv1(self.relu(self.bn1(x)))
+        if self.droprate > 0:
+            out = QuaternionDropout(p=self.droprate)(out)
+        return self.pool(out)
 
-        self.dropout2 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+class DenseBlock(nn.Module):
+    def __init__(self, nb_layers, in_planes, growth_rate, block, dropRate=0.0):
+        super(DenseBlock, self).__init__()
+        self.layer = self._make_layer(block, in_planes, growth_rate, nb_layers, dropRate)
+    def _make_layer(self, block, in_planes, growth_rate, nb_layers, dropRate):
+        layers = []
+        for i in range(nb_layers):
+            layers.append(block(in_planes+i*growth_rate, growth_rate, dropRate))
+        return nn.Sequential(*layers)
+    def forward(self, x):
+        return self.layer(x)
 
-        # Add batch normalization after shortcut for better regularization
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = QConv2D(in_channels, out_channels, kernel_size=1,
-                                stride=stride, mapping_type=mapping_type)
-            
+class QuaternionDenseNet(nn.Module):
+    def __init__(self, depth, num_classes, growth_rate=12,
+                 reduction=0.5, bottleneck=True, dropRate=0.0):
+        super(QuaternionDenseNet, self).__init__()
+        in_planes = 2 * growth_rate
+        n = (depth - 4) / 3
+        if bottleneck:
+            n = n/2
+            block = BottleneckBlock
+        else:
+            block = BasicBlock
+        n = int(n)
+        
+        # First conv before any dense block - special handling for RGB input
+        self.conv1 = QConv2D(3, in_planes, kernel_size=3, stride=1,
+                           padding=1, bias=False, mapping_type='raw_normalized')
+        
+        # Dense blocks
+        self.block1 = DenseBlock(n, in_planes, growth_rate, block, dropRate)
+        in_planes = int(in_planes + n * growth_rate)
+        self.trans1 = TransitionBlock(in_planes, 
+                                              int(math.floor(in_planes * reduction)), 
+                                              dropRate=dropRate)
+        in_planes = int(math.floor(in_planes * reduction))
+        
+        self.block2 = DenseBlock(n, in_planes, growth_rate, block, dropRate)
+        in_planes = int(in_planes + n * growth_rate)
+        self.trans2 = TransitionBlock(in_planes, 
+                                              int(math.floor(in_planes * reduction)), 
+                                              dropRate=dropRate)
+        in_planes = int(math.floor(in_planes * reduction))
+        
+        self.block3 = DenseBlock(n, in_planes, growth_rate, block, dropRate)
+        in_planes = int(in_planes + n * growth_rate)
+        
+        # Global average pooling and classifier
+        self.bn1 = IQBN(in_planes)
+        self.relu = QPReLU()
+        self.fc = QDense(in_planes, num_classes * 4)  # *4 for quaternion output
+        self.in_planes = in_planes
+        self.global_pool = QuaternionAvgPool()
+
 
     def forward(self, x):
-        identity = self.shortcut(x)
-        
-
-        # First block
         out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = self.dropout1(out)
-        # Second block
-        out = self.conv2(out)
-        out = self.relu(out)
-        out = self.bn2(out)
-        out = self.dropout2(out)
-      
-        out += identity
-        return out
+        out = self.trans1(self.block1(out))
+        out = self.trans2(self.block2(out))
+        out = self.block3(out)
+        out = self.relu(self.bn1(out))
+        # Use quaternion global pooling
+        out = self.global_pool(out)
+        out = out.view(-1, self.in_planes)
+        out = self.fc(out)
+        
+        # Extract real components for final output
+        batch_size = out.size(0)
+        out = out.view(batch_size, -1, 4)  # Reshape to separate quaternion components
+        return out[:, :, 0]  # Return real component [batch_size, num_classes]
 
-
+def create_quaternion_densenet(depth=40, num_classes=10, growth_rate=12, dropRate=0.0):
+    """Helper function to create a Quaternion DenseNet with standard configuration"""
+    return QuaternionDenseNet(
+        depth=depth,
+        num_classes=num_classes,
+        growth_rate=growth_rate,
+        reduction=0.5,
+        bottleneck=True,
+        dropRate=dropRate
+    )
 
 class QResNet34(nn.Module):
     """
@@ -609,79 +625,178 @@ class QuaternionCIFAR10(nn.Module):
         
         return real_components
 
-def worker_init_fn(worker_id):
-    torch.cuda.empty_cache()
-    # Optional: force garbage collection
-    gc.collect()
 
-def get_data_loaders():
-    """
-    Prepare CIFAR-10 data loaders with augmentation.
-    """
-    if DATA_AUGMENTATION:
-        transform_train = transforms.Compose([
+
+class MultiAugmentDataset(torch.utils.data.Dataset):
+    """Dataset wrapper that applies multiple augmentations to each image"""
+    def __init__(self, dataset, augmentations_per_image=3, train=True):
+        self.dataset = dataset
+        self.augmentations_per_image = augmentations_per_image
+        self.train = train
+        
+        # Strong augmentation for training
+        self.strong_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+            transforms.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.3,
+                hue=0.1
+            ),
             transforms.RandomRotation(15),
+            transforms.RandomAffine(
+                degrees=0,
+                translate=(0.1, 0.1),
+                scale=(0.9, 1.1)
+            ),
+            transforms.RandomApply([
+                transforms.GaussianBlur(3, sigma=(0.1, 2.0))
+            ], p=0.3),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
+                               (0.2023, 0.1994, 0.2010))
         ])
-    else:
-        transform_train = transforms.Compose([
+        
+        # Weak augmentation for one of the copies (maintains some original image properties)
+        self.weak_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
+                               (0.2023, 0.1994, 0.2010))
         ])
+        
+        # Test transform
+        self.test_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
+                               (0.2023, 0.1994, 0.2010))
+        ])
+        
+        # Pre-compute augmentation indices for efficiency
+        if self.train:
+            self.indices = []
+            for idx in range(len(dataset)):
+                self.indices.extend([idx] * augmentations_per_image)
 
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-    ])
+    def __getitem__(self, index):
+        if self.train:
+            real_idx = self.indices[index]
+            image, label = self.dataset[real_idx]
+            
+            # First augmentation is always weak, others are strong
+            if index % self.augmentations_per_image == 0:
+                transformed = self.weak_transform(image)
+            else:
+                transformed = self.strong_transform(image)
+                
+            return transformed, label
+        else:
+            image, label = self.dataset[index]
+            return self.test_transform(image), label
 
-    class GPUDataset(torch.utils.data.Dataset):
-        def __init__(self, dataset):
-            self.dataset = dataset
-            # Pre-fetch everything to GPU once
-            self.data = torch.stack([x for x, _ in dataset]).pin_memory().to(DEVICE, non_blocking=True)
-            self.targets = torch.tensor([y for _, y in dataset], device=DEVICE)
-            
-        def __getitem__(self, idx):
-            return self.data[idx], self.targets[idx]
-            
-        def __len__(self):
-            return len(self.dataset)
+    def __len__(self):
+        if self.train:
+            return len(self.dataset) * self.augmentations_per_image
+        return len(self.dataset)
+
+def get_data_loaders(batch_size=128, augmentations_per_image=3, num_workers=4):
+    """Get train and test data loaders with multiple augmentations"""
     
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, 
-                                           download=True, transform=transform_train)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, 
-                                          download=True, transform=transform_test)
+    # Load base CIFAR-10 dataset
+    trainset = torchvision.datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=None)
+    testset = torchvision.datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=None)
     
-    # Wrap datasets to keep data on GPU
-    train_gpu_dataset = GPUDataset(trainset)
-    test_gpu_dataset = GPUDataset(testset)
+    # Wrap datasets with multi-augmentation
+    train_dataset = MultiAugmentDataset(
+        trainset, 
+        augmentations_per_image=augmentations_per_image,
+        train=True
+    )
+    test_dataset = MultiAugmentDataset(
+        testset,
+        augmentations_per_image=1,  # No augmentation for test
+        train=False
+    )
     
-    trainloader = DataLoader(
-        train_gpu_dataset,
-        batch_size=BATCH_SIZE,
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Set to 0 since data is already on GPU
-        pin_memory=False  # Not needed since data is already on GPU
+        num_workers=num_workers,
+        pin_memory=True
     )
     
-    testloader = DataLoader(
-        test_gpu_dataset,
-        batch_size=BATCH_SIZE,
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=False
+        num_workers=num_workers,
+        pin_memory=True
     )
     
-    return trainloader, testloader
+    return train_loader, test_loader
 
-def evaluate(model, test_loader, criterion, epoch, writer):
+def train_epoch(model, train_loader, criterion, optimizer, epoch):
+    """
+    Train for one epoch, adjusted for multiple augmentations
+    """
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    num_batches = len(train_loader)
+    
+    train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
+    
+    for batch_idx, (inputs, targets) in enumerate(train_pbar):
+        inputs, targets = inputs.cuda(), targets.cuda()
+        
+        optimizer.zero_grad(set_to_none=True)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # Update metrics
+        running_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+        
+        # Update progress bar
+        current_acc = 100. * correct / total
+        current_loss = running_loss / (batch_idx + 1)
+        train_pbar.set_postfix({
+            'Loss': f'{current_loss:.4f}',
+            'Acc': f'{current_acc:.2f}%',
+            'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+        })
+        
+        # Clean up
+        del outputs, loss
+        
+    train_pbar.close()
+    
+    # Return average metrics (adjusted for actual number of unique images)
+    unique_images = total // NUM_AUGMENTATIONS  # Divide by number of augmentations
+    return (running_loss / num_batches, 
+            100. * correct / total,
+            unique_images)  # Return number of unique images processed
+
+def evaluate(model, test_loader, criterion):
+    """
+    Evaluate the model (no changes needed for augmentation as test set is unchanged)
+    """
     model.eval()
     test_loss = 0
-    test_reg_loss = 0
     correct = 0
     total = 0
     
@@ -689,11 +804,11 @@ def evaluate(model, test_loader, criterion, epoch, writer):
     
     with torch.no_grad():
         for inputs, targets in test_pbar:
+            inputs, targets = inputs.cuda(), targets.cuda()
             outputs = model(inputs)
-            criterion_loss = criterion(outputs, targets)
-
-
-            test_loss += criterion_loss.item()
+            loss = criterion(outputs, targets)
+            
+            test_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
@@ -701,84 +816,40 @@ def evaluate(model, test_loader, criterion, epoch, writer):
             current_acc = 100. * correct / total
             test_pbar.set_postfix({
                 'Loss': f'{test_loss/total:.4f}',
-                'Accuracy': f'{current_acc:.2f}%'
+                'Acc': f'{current_acc:.2f}%'
             })
             
-            del outputs, criterion_loss, predicted
-            
+            del outputs, loss
+    
     test_pbar.close()
-    
-    test_acc = 100. * correct / total
-    avg_test_loss = test_loss / len(test_loader)
-    
-    return test_acc, avg_test_loss
-
-def train_epoch(model, train_loader, criterion, optimizer, l1_reg, epoch):
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
-    running_reg_loss = 0.0
-
-    train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
-
-    
-    for batch_idx, (inputs, targets) in enumerate(train_pbar):
-        # Remove .to(DEVICE) since data is already there
-        optimizer.zero_grad(set_to_none=True)
-        
-        outputs = model(inputs)
-        criterion_loss = criterion(outputs, targets)
-        # l1_loss = l1_reg(model)
-        total_loss = criterion_loss 
-        total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        # Update metrics
-        running_loss += criterion_loss.item()
-        # running_reg_loss += l1_loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
-        
-        # Clear intermediates but keep batch data on GPU
-        del outputs, criterion_loss, total_loss, predicted
-        
-        current_acc = 100. * correct / total
-        train_pbar.set_postfix({
-            'Loss': f'{running_loss/(batch_idx+1):.4f}',
-            # 'Reg Loss': f'{running_reg_loss/(batch_idx+1):.4f}',
-            'Accuracy': f'{current_acc:.2f}%'
-        })
-    
-    train_pbar.close()
-    train_acc = 100. * correct / total
-    avg_train_loss = running_loss / len(train_loader)
-
-    
-    return train_acc, avg_train_loss
-
+    return test_loss / len(test_loader), 100. * correct / total
 
 def main():
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
     
-    writer = SummaryWriter('runs/QRN34_quat_SGD')
+    # Constants for augmentation
+    NUM_AUGMENTATIONS = 3  # Number of augmentations per image
+    
+    # Initialize logging
+    writer = SummaryWriter('runs/quaternion_densenet')
     metrics_logger = MetricsLogger(SAVE_DIR)
     
-    train_loader, test_loader = get_data_loaders()
-    
+    # Get dataloaders with augmentation
+    train_loader, test_loader = get_data_loaders(
+        batch_size=BATCH_SIZE,
+        augmentations_per_image=NUM_AUGMENTATIONS
+    )
     model = QResNet34(num_classes=10, mapping_type='raw_normalized').to(DEVICE)
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), 
                             lr=0.1,
                             momentum=0.9, 
-                            weight_decay=5e-4,
+                            weight_decay=1e-4,
                             nesterov=True)
     
 
@@ -874,28 +945,17 @@ def main():
     pbar = tqdm.tqdm(total=EPOCHS, desc='Training Progress', position=0)
     
     for epoch in range(EPOCHS):
-        # if epoch % 5 == 0:  # Flush writer periodically
-        #     writer.flush()
         # Training
-        torch.cuda.empty_cache()
-        gc.collect()
+        train_loss, train_acc, unique_images = train_epoch(
+            model, train_loader, criterion, optimizer, epoch)
         
-        train_acc, avg_train_loss = train_epoch(
-            model, train_loader, criterion, optimizer, l1_reg, epoch)
-            
-        with torch.cuda.device(DEVICE):
-            torch.cuda.empty_cache()
-            
-        test_acc, avg_test_loss = evaluate(
-            model, test_loader, criterion, epoch, writer)
+        # Validation
+        test_loss, test_acc = evaluate(model, test_loader, criterion)
         
-        scheduler.step()
-
-        # if epoch in scheduler.milestones:
-        #     model.update_dropout_rates()
-        #     print(f'Epoch {epoch}: Updated dropout rates to:', model.current_rates)
-        current_lr = scheduler.get_last_lr()[0]
-
+        # Step scheduler
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Update progress bar
         pbar.update(1)
         pbar.set_postfix({
             'Train Acc': f'{train_acc:.2f}%',
@@ -907,45 +967,45 @@ def main():
         metrics_logger.update({
             'train_acc': train_acc,
             'test_acc': test_acc,
-            'train_loss': avg_train_loss,
-            'test_loss': avg_test_loss,
+            'train_loss': train_loss,
+            'test_loss': test_loss,
+            'unique_images': unique_images  # Track number of unique images
         })
         
-        # Log to tensorboard
+        # TensorBoard logging
         writer.add_scalar('learning_rate', current_lr, epoch)
-        writer.add_scalar('training accuracy', train_acc, epoch)
-        writer.add_scalar('test accuracy', test_acc, epoch)
-        writer.add_scalar('train loss', avg_train_loss, epoch)
-        writer.add_scalar('test loss', avg_test_loss, epoch)
-        # Create visualization every 10 epochs
+        writer.add_scalar('training/accuracy', train_acc, epoch)
+        writer.add_scalar('test/accuracy', test_acc, epoch)
+        writer.add_scalar('training/loss', train_loss, epoch)
+        writer.add_scalar('test/loss', test_loss, epoch)
+        
+        # Save metrics visualization
         if (epoch + 1) % 10 == 0:
             metrics_logger.save()
-            metrics_logger.plot()      
-        # Save best model
-        # if test_acc > 85.00:
-        if epoch % 10 == 0:
-            if test_acc > best_acc:
-                print(f'\nSaving model (acc: {test_acc:.2f}%)')
-                best_acc = test_acc
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'accuracy': best_acc,
-                }, os.path.join(SAVE_DIR, MODEL_NAME))
+            metrics_logger.plot()
         
-        # Force garbage collection
+        # Save best model
+        if test_acc > best_acc:
+            best_acc = test_acc
+            print(f'\nSaving model (acc: {test_acc:.2f}%)')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'accuracy': best_acc,
+            }, os.path.join(SAVE_DIR, MODEL_NAME))
+        
+        # Clean up
         torch.cuda.empty_cache()
         gc.collect()
     
     pbar.close()
-    metrics_logger.plot('Q34_final.png')
-
-    writer.flush() 
+    metrics_logger.plot('final_metrics.png')
     writer.close()
     
     print(f'Best test accuracy: {best_acc:.2f}%')
+
 
 if __name__ == '__main__':
     main()

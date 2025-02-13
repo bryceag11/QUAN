@@ -8,7 +8,6 @@ from .blocks.block import C3k2, SPPF, C2PSA , PSABlock
 from .neck.neck import QuaternionConcat, QuaternionFPN, QuaternionPAN, QuaternionUpsample
 from .heads.qdet_head import QDetectHead, QOBBHead, QuaternionPooling
 import torch 
-from data.transforms.quaternion import RGBtoQuatTransform
 from quaternion.qbatch_norm import IQBN, QBN
 
 # models/model_builder.py
