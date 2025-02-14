@@ -463,7 +463,8 @@ class QConv2D(QConv):
                  bias: bool = True,
                  padding_mode: str = 'zeros',
                  device=None,
-                 dtype=None) -> None:
+                 dtype=None,
+                 mapping_type: str='raw_normalized') -> None:
         super().__init__(
             rank=2,  # Fixed for 2D convolution
             in_channels=in_channels,
@@ -476,7 +477,8 @@ class QConv2D(QConv):
             bias=bias,
             padding_mode=padding_mode,
             device=device,
-            dtype=dtype
+            dtype=dtype,
+            mapping_type=mapping_type
         )
 
 

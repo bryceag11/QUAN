@@ -78,7 +78,7 @@ def count_parameters(model):
 
 
 # Configuration
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 NUM_CLASSES = 10
 EPOCHS = 300
 LEARNING_RATE = 0.001
@@ -88,6 +88,7 @@ EPSILON = 1e-7
 L1_REG = 1e-5
 L2_REG = 1e-4
 DATA_AUGMENTATION = True
+NUM_AUGMENTATIONS=3
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 SAVE_DIR = 'saved_models_final'
 MODEL_NAME = 'Q34_adamw.pth'
@@ -372,6 +373,49 @@ def create_quaternion_densenet(depth=40, num_classes=10, growth_rate=12, dropRat
         dropRate=dropRate
     )
 
+class QuaternionBasicBlock(nn.Module):
+    """Enhanced residual block for quaternion networks"""
+    def __init__(self, in_channels, out_channels, stride=1, dropout_rate=0.0):
+        super(QuaternionBasicBlock, self).__init__()
+        
+        # First convolution block
+        self.conv1 = QConv2D(in_channels, out_channels, kernel_size=3, 
+                            stride=stride, padding=1)
+        self.bn1 = IQBN(out_channels)
+        self.relu = nn.SiLU()
+
+        self.dropout1 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        # Second convolution block
+        self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3,
+                            stride=1, padding=1)
+        self.bn2 = IQBN(out_channels)
+
+        self.dropout2 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
+
+        # Add batch normalization after shortcut for better regularization
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = QConv2D(in_channels, out_channels, kernel_size=1,
+                                stride=stride)
+    def forward(self, x):
+        identity = self.shortcut(x)
+        
+
+        # First block
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout1(out)
+        # Second block
+        out = self.conv2(out)
+        out = self.relu(out)
+        out = self.bn2(out)
+        out = self.dropout2(out)
+      
+        out += identity
+        return out
+    
 class QResNet34(nn.Module):
     """
     Quaternion ResNet34 implementation exactly matching the paper's architecture
@@ -444,7 +488,6 @@ class QResNet34(nn.Module):
             in_channels=in_channels,
             out_channels=out_channels,
             stride=stride,
-            mapping_type=mapping_type,
             dropout_rate=self.current_rates[dropout_idx]  # Use current_rates with index
         ))
         
@@ -454,7 +497,6 @@ class QResNet34(nn.Module):
                 in_channels=out_channels,
                 out_channels=out_channels,
                 stride=1,
-                mapping_type=mapping_type,
                 dropout_rate=self.current_rates[dropout_idx]  # Same dropout rate for all blocks in layer
             ))
         
@@ -904,8 +946,8 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[150, 225],
-        gamma=0.2,
+        milestones=[75, 150, 225],
+        gamma=0.1,
     )
 
     # scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -943,6 +985,7 @@ def main():
     
     best_acc = 0
     pbar = tqdm.tqdm(total=EPOCHS, desc='Training Progress', position=0)
+  
     
     for epoch in range(EPOCHS):
         # Training
@@ -953,7 +996,8 @@ def main():
         test_loss, test_acc = evaluate(model, test_loader, criterion)
         
         # Step scheduler
-        current_lr = optimizer.param_groups[0]['lr']
+        scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
         
         # Update progress bar
         pbar.update(1)
@@ -969,7 +1013,6 @@ def main():
             'test_acc': test_acc,
             'train_loss': train_loss,
             'test_loss': test_loss,
-            'unique_images': unique_images  # Track number of unique images
         })
         
         # TensorBoard logging
