@@ -7,6 +7,7 @@ import numpy as np
 from typing import Union, Tuple, List, Optional
 import math
 from .qbatch_norm import QBN, IQBN
+from .qactivation import QPReLU
 __all__ = ['Conv', 'DWConv', 'QConv', 'QConv1D', 'QConv2D',
            'QConv3D', 'QDense', 'QInit']
 
@@ -34,31 +35,31 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 #         return (k - 1) // 2
 #     return p
 
-class Conv(nn.Module):
-    default_act = nn.SiLU()  # default activation
+# class Conv(nn.Module):
+#     default_act = nn.SiLU()  # default activation
 
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-        """Initialize Conv layer with given arguments including activation."""
-        super().__init__()
-        self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-        self.bn = IQBN(c2)
-        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+#         """Initialize Conv layer with given arguments including activation."""
+#         super().__init__()
+#         self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+#         self.bn = IQBN(c2)
+#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
-    def forward(self, x):
-        """Apply convolution, batch normalization and activation to input tensor."""
-        # print(f"X type: {x.dtype}")
-        return self.act(self.bn(self.conv(x)))
+#     def forward(self, x):
+#         """Apply convolution, batch normalization and activation to input tensor."""
+#         # print(f"X type: {x.dtype}")
+#         return self.act(self.bn(self.conv(x)))
 
-    def forward_fuse(self, x):
-        """Apply convolution and activation without batch normalization."""
-        return self.act(self.conv(x))
+#     def forward_fuse(self, x):
+#         """Apply convolution and activation without batch normalization."""
+#         return self.act(self.conv(x))
 
-class DWConv(Conv):
-    """Depth-wise convolution."""
+# class DWConv(Conv):
+#     """Depth-wise convolution."""
 
-    def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
-        """Initialize Depth-wise convolution with given parameters."""
-        super().__init__(c1, c2, k, s, g=math.gcd(c1//4, c2//4), d=d, act=act)
+#     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
+#         """Initialize Depth-wise convolution with given parameters."""
+#         super().__init__(c1, c2, k, s, g=math.gcd(c1//4, c2//4), d=d, act=act)
 # Geometric
 # class QConv(nn.Module):
 #     def __init__(self, 
@@ -240,12 +241,10 @@ class QConv(nn.Module):
                  groups: int = 1,
                  bias: bool = True,
                  padding_mode: str = 'zeros',
-                 device=None,
                  dtype=None,
                  mapping_type: str = 'raw_normalized') -> None:
         super(QConv, self).__init__()
         
-        self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
 
         assert rank in [1, 2, 3], "rank must be 1, 2, or 3"
         
@@ -284,52 +283,122 @@ class QConv(nn.Module):
         
         self.conv_r = Conv(actual_in_channels, out_channels_quat, kernel_size,
                           stride, padding, dilation, groups, bias, 
-                          padding_mode, device=self.device, dtype=dtype).to(self.device)
+                          padding_mode)
         
         self.conv_i = Conv(actual_in_channels, out_channels_quat, kernel_size,
                           stride, padding, dilation, groups, bias, 
-                          padding_mode, device=self.device, dtype=dtype).to(self.device)
+                          padding_mode)
         
         self.conv_j = Conv(actual_in_channels, out_channels_quat, kernel_size,
                           stride, padding, dilation, groups, bias, 
-                          padding_mode, device=self.device, dtype=dtype).to(self.device)
+                          padding_mode)
         
         self.conv_k = Conv(actual_in_channels, out_channels_quat, kernel_size,
                           stride, padding, dilation, groups, bias, 
-                          padding_mode, device=self.device, dtype=dtype).to(self.device)
-                          
+                          padding_mode)
+                      
         self._initialize_weights()
 
-    def _initialize_weights(self):
-        # Calculate fan_in for initialization
-        kernel_prod = np.prod(self.kernel_size)
+
+# Proper Quat Initilization with reg sigma 
+    # def _initialize_weights(self):
+    #     # Determine the appropriate sigma based on activation
+    #     sigma = 1.0 / math.sqrt(2 * self.in_channels // 4)
+    #     # sigma = 1.0 / math.sqrt(2 * (self.in_channels + self.out_channels) // 4)
         
-        # Handle first layer vs. subsequent layers
+    #     # For each weight
+    #     for conv in [self.conv_r, self.conv_i, self.conv_j, self.conv_k]:
+    #         # Reset existing weights
+    #         with torch.no_grad():
+    #             weight_shape = conv.weight.shape
+    #             # Flatten for easier handling
+    #             flattened = conv.weight.view(-1)
+                
+    #             # For each weight element
+    #             for i in range(flattened.size(0)):
+    #                 # Generate Rayleigh random value
+    #                 phi = torch.randn(1).to(conv.weight.device) * sigma
+                    
+    #                 # Generate uniform random angle
+    #                 theta = torch.rand(1).to(conv.weight.device) * math.pi - (math.pi/2)
+                    
+    #                 # Generate uniform random unit vector
+    #                 x, y, z = torch.rand(3).to(conv.weight.device)
+    #                 norm = torch.sqrt(x*x + y*y + z*z)
+    #                 x, y, z = x/norm, y/norm, z/norm
+                    
+    #                 # Create normalized unit quaternion
+    #                 u = torch.tensor([x, y, z]).to(conv.weight.device)
+                    
+    #                 # Apply scaling and rotation
+    #                 if conv is self.conv_r:
+    #                     flattened[i] = phi * math.cos(theta)
+    #                 elif conv is self.conv_i:
+    #                     flattened[i] = phi * math.sin(theta) * u[0]
+    #                 elif conv is self.conv_j:
+    #                     flattened[i] = phi * math.sin(theta) * u[1]
+    #                 elif conv is self.conv_k:
+    #                     flattened[i] = phi * math.sin(theta) * u[2]
+                
+    #             # Reshape back
+    #             conv.weight.copy_(flattened.view(weight_shape))
+        
+    #     # Initialize biases if present
+    #     if self.conv_r.bias is not None:
+    #         nn.init.zeros_(self.conv_r.bias)
+
+# OG Weight Initialization
+    # def _initialize_weights(self):
+    #     kernel_prod = np.prod(self.kernel_size)
+    #     fan_in = (self.in_channels // 4 if not self.is_first_layer else 1) * kernel_prod
+        
+    #     # Initialize real convolution (conv_r)
+    #     nn.init.kaiming_uniform_(self.conv_r.weight, a=math.sqrt(5))
+    #     if self.conv_r.bias is not None:
+    #         bound = 1 / math.sqrt(fan_in)
+    #         nn.init.uniform_(self.conv_r.bias, -bound, bound)
+        
+    #     # Initialize imaginary parts with smaller weights
+    #     scale_factors = {
+    #         'luminance': [1.0, 0.5, 0.5, 0.5],
+    #         'mean_brightness': [1.0, 0.75, 0.75, 0.75],
+    #         'raw_normalized': [1.0, 1.0, 1.0, 1.0]
+    #     }
+    #     scales = scale_factors.get(self.mapping_type, [0.5, 0.5, 0.5, 0.5])
+        
+    #     convs = [self.conv_i, self.conv_j, self.conv_k]
+    #     for i, conv in enumerate(convs):
+    #         nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i+1])
+
+# Bias for all layers weight init
+    def _initialize_weights(self):
+        
+        kernel_prod = np.prod(self.kernel_size)
         fan_in = (self.in_channels // 4 if not self.is_first_layer else 1) * kernel_prod
         
-        # Initialize real convolution (conv_rr)
-        nn.init.kaiming_uniform_(self.conv_r.weight, a=math.sqrt(5))
-        if self.conv_r.bias is not None:
-            bound = 1 / math.sqrt(fan_in)
-            nn.init.uniform_(self.conv_r.bias, -bound, bound)
-        
-        # Initialize imaginary parts with smaller weights
+        # Scale factors for quaternion components
         scale_factors = {
-            'luminance': [1.0, 0.5, 0.5, 0.5],      # Emphasize luminance
+            'luminance': [1.0, 0.5, 0.5, 0.5],      # Emphasize real component
             'mean_brightness': [1.0, 0.75, 0.75, 0.75],  # Slightly more balanced
             'raw_normalized': [1.0, 1.0, 1.0, 1.0]  # Equal emphasis
         }
-        
         scales = scale_factors.get(self.mapping_type, [0.5, 0.5, 0.5, 0.5])
         
-        convs = [self.conv_i, self.conv_j, self.conv_k]
+        # All convolution layers
+        convs = [self.conv_r, self.conv_i, self.conv_j, self.conv_k]
+        
         for i, conv in enumerate(convs):
-            nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i+1])
+            # Weight initialization with scaled Kaiming
+            nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i])
+            
+            # Bias initialization (if present)
+            if conv.bias is not None:
+                bound = 1 / math.sqrt(fan_in) * scales[i]  # Scale bias bound by component weight
+                nn.init.uniform_(conv.bias, -bound, bound)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # print("X type:", x.dtype)
-        x = x.to(self.device)
-        # print(f"Weight dtype: {self.conv_r.weight.dtype}")
+
         # Handle RGB input conversion for first layer
         if x.size(1) == 3:  # RGB input
             with torch.no_grad():  # Prevent memory accumulation during conversion
@@ -386,70 +455,33 @@ class QConv(nn.Module):
         del r_conv, i_conv, j_conv, k_conv
         
         return out
-
-    def rgb_to_quaternion(self, rgb_input):
-        """Convert RGB to quaternion-like representation"""
-        B, C, H, W = rgb_input.shape
-        
-        # Luminance-based
-        luminance = (0.299 * rgb_input[:, 0] + 
-                     0.587 * rgb_input[:, 1] + 
-                     0.114 * rgb_input[:, 2]).unsqueeze(1)
-        
-        # Mean Brightness
-        mean_brightness = rgb_input.mean(dim=1, keepdim=True)
-        
-        # Normalized Channels
-        rgb_normalized = (rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min())
-        
-        # New Hamilton mapping
-        def hamilton_mapping(x):
-            # Map RGB to pure quaternion using Hamilton embedding
-            # Real part is 0, and RGB maps to i,j,k components
-            real = torch.zeros_like(x[:, 0:1])
-            return torch.cat([
-                real,  # Real part (0)
-                x[:, 0:1],  # R -> i component
-                x[:, 1:2],  # G -> j component
-                x[:, 2:3]   # B -> k component
-            ], dim=1)
-        
-        # New Poincaré mapping
-        def poincare_mapping(x):
-            # Normalize to unit ball (Poincaré disk)
-            norm = torch.norm(x, dim=1, keepdim=True)
-            x_normalized = x / (norm + 1)  # Map to Poincaré ball
-            
-            # Create quaternion with normalized RGB
-            return torch.cat([
-                torch.sqrt(1 - torch.sum(x_normalized**2, dim=1, keepdim=True)),  # Real part
-                x_normalized[:, 0:1],  # R component
-                x_normalized[:, 1:2],  # G component
-                x_normalized[:, 2:3]   # B component
-            ], dim=1)
     
-        # Mapping strategies
-        mappings = {
-            'luminance': torch.cat([luminance, 
-                                     rgb_normalized[:, 0:1], 
-                                     rgb_normalized[:, 1:2], 
-                                     rgb_normalized[:, 2:3]], dim=1),
-            
-            'mean_brightness': torch.cat([mean_brightness, 
-                                           rgb_input[:, 0:1], 
-                                           rgb_input[:, 1:2], 
-                                           rgb_input[:, 2:3]], dim=1),
-            
-            'raw_normalized': torch.cat([rgb_normalized.mean(dim=1, keepdim=True), 
-                                          rgb_normalized[:, 0:1], 
-                                          rgb_normalized[:, 1:2], 
-                                          rgb_normalized[:, 2:3]], dim=1),
-            'hamilton': hamilton_mapping(rgb_input),
-            'poincare': poincare_mapping(rgb_input)        
-        }
+    def rgb_to_quaternion(self, rgb_input):
+        B, C, H, W = rgb_input.shape
+        luminance = (0.299 * rgb_input[:, 0] + 0.587 * rgb_input[:, 1] + 0.114 * rgb_input[:, 2]).unsqueeze(1).to(rgb_input.device)
+        mean_brightness = rgb_input.mean(dim=1, keepdim=True).to(rgb_input.device)
+        rgb_normalized = ((rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min())).to(rgb_input.device)
         
+        def hamilton_mapping(x):
+            real = torch.zeros_like(x[:, 0:1]).to(x.device)
+            return torch.cat([real, x[:, 0:1], x[:, 1:2], x[:, 2:3]], dim=1)
+        
+        def poincare_mapping(x):
+            norm = torch.norm(x, dim=1, keepdim=True)
+            x_normalized = (x / (norm + 1)).to(x.device)
+            return torch.cat([torch.sqrt(1 - torch.sum(x_normalized**2, dim=1, keepdim=True)), 
+                            x_normalized[:, 0:1], x_normalized[:, 1:2], x_normalized[:, 2:3]], dim=1)
+        
+        mappings = {
+            'luminance': torch.cat([luminance, rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
+            'mean_brightness': torch.cat([mean_brightness, rgb_input[:, 0:1], rgb_input[:, 1:2], rgb_input[:, 2:3]], dim=1),
+            'raw_normalized': torch.cat([rgb_normalized.mean(dim=1, keepdim=True), 
+                                        rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
+            'hamilton': hamilton_mapping(rgb_input),
+            'poincare': poincare_mapping(rgb_input)
+        }
         return mappings[self.mapping_type]
-
+    
 class QConv2D(QConv):
     """2D Quaternion Convolution layer."""
     def __init__(self,
@@ -462,7 +494,6 @@ class QConv2D(QConv):
                  groups: int = 1,
                  bias: bool = True,
                  padding_mode: str = 'zeros',
-                 device=None,
                  dtype=None,
                  mapping_type: str='raw_normalized') -> None:
         super().__init__(
@@ -476,7 +507,6 @@ class QConv2D(QConv):
             groups=groups,
             bias=bias,
             padding_mode=padding_mode,
-            device=device,
             dtype=dtype,
             mapping_type=mapping_type
         )

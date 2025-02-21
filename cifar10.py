@@ -78,7 +78,7 @@ def count_parameters(model):
 
 
 # Configuration
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 NUM_CLASSES = 10
 EPOCHS = 300
 LEARNING_RATE = 0.001
@@ -318,7 +318,7 @@ class QuaternionDenseNet(nn.Module):
         
         # First conv before any dense block - special handling for RGB input
         self.conv1 = QConv2D(3, in_planes, kernel_size=3, stride=1,
-                           padding=1, bias=False, mapping_type='raw_normalized')
+                           padding=1, bias=False, mapping_type='poincare')
         
         # Dense blocks
         self.block1 = DenseBlock(n, in_planes, growth_rate, block, dropRate)
@@ -743,7 +743,7 @@ class MultiAugmentDataset(torch.utils.data.Dataset):
             return len(self.dataset) * self.augmentations_per_image
         return len(self.dataset)
 
-def get_data_loaders(batch_size=128, augmentations_per_image=3, num_workers=4):
+def get_data_loaders(batch_size=256, augmentations_per_image=3, num_workers=8):
     """Get train and test data loaders with multiple augmentations"""
     
     # Load base CIFAR-10 dataset
@@ -768,42 +768,59 @@ def get_data_loaders(batch_size=128, augmentations_per_image=3, num_workers=4):
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
-    )
+        pin_memory=True,  
+        persistent_workers=True,  
+        prefetch_factor=3,
+        drop_last=True
+    ) 
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,  
+        persistent_workers=True, 
+        prefetch_factor=3,
+        drop_last=True 
     )
     
     return train_loader, test_loader
 
-def train_epoch(model, train_loader, criterion, optimizer, epoch):
+# def print_memory_stats():
+#     print(f"\nMemory Stats:")
+#     print(f"GPU Memory: {torch.cuda.memory_allocated()/1e9:.1f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
+#     process = psutil.Process()
+#     print(f"CPU Memory: {process.memory_info().rss/1e9:.1f}GB")
+#     print(f"CPU Usage: {psutil.cpu_percent()}%")
+
+def train_epoch(model, train_loader, criterion, optimizer, epoch, device):
     """
-    Train for one epoch, adjusted for multiple augmentations
+    Train for one epoch with optimized GPU handling
     """
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
-    num_batches = len(train_loader)
     
     train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
     
     for batch_idx, (inputs, targets) in enumerate(train_pbar):
-        inputs, targets = inputs.cuda(), targets.cuda()
+        # Move data to GPU efficiently
+        inputs = inputs.cuda(device, non_blocking=True)
+        targets = targets.cuda(device, non_blocking=True)
         
-        optimizer.zero_grad(set_to_none=True)
+        # Zero gradients
+        optimizer.zero_grad(set_to_none=True)  # More efficient than standard zero_grad()
+        
+        # Forward pass
         outputs = model(inputs)
         loss = criterion(outputs, targets)
-        loss.backward()
         
-        # Gradient clipping
+        # Backward pass
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         
@@ -814,39 +831,31 @@ def train_epoch(model, train_loader, criterion, optimizer, epoch):
         correct += predicted.eq(targets).sum().item()
         
         # Update progress bar
-        current_acc = 100. * correct / total
-        current_loss = running_loss / (batch_idx + 1)
         train_pbar.set_postfix({
-            'Loss': f'{current_loss:.4f}',
-            'Acc': f'{current_acc:.2f}%',
-            'LR': f'{optimizer.param_groups[0]["lr"]:.6f}'
+            'Loss': f'{running_loss/(batch_idx+1):.4f}',
+            'Acc': f'{100.*correct/total:.2f}%'
         })
         
-        # Clean up
+        # Clean up GPU memory
         del outputs, loss
         
     train_pbar.close()
-    
-    # Return average metrics (adjusted for actual number of unique images)
-    unique_images = total // NUM_AUGMENTATIONS  # Divide by number of augmentations
-    return (running_loss / num_batches, 
-            100. * correct / total,
-            unique_images)  # Return number of unique images processed
+    return running_loss / len(train_loader), 100. * correct / total
 
-def evaluate(model, test_loader, criterion):
+def evaluate(model, test_loader, criterion, device):
     """
-    Evaluate the model (no changes needed for augmentation as test set is unchanged)
+    Evaluate with optimized GPU handling
     """
     model.eval()
     test_loss = 0
     correct = 0
     total = 0
     
-    test_pbar = tqdm.tqdm(test_loader, desc='Testing', position=1, leave=False)
-    
     with torch.no_grad():
-        for inputs, targets in test_pbar:
-            inputs, targets = inputs.cuda(), targets.cuda()
+        for inputs, targets in test_loader:
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             
@@ -855,15 +864,8 @@ def evaluate(model, test_loader, criterion):
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
             
-            current_acc = 100. * correct / total
-            test_pbar.set_postfix({
-                'Loss': f'{test_loss/total:.4f}',
-                'Acc': f'{current_acc:.2f}%'
-            })
-            
             del outputs, loss
     
-    test_pbar.close()
     return test_loss / len(test_loader), 100. * correct / total
 
 def main():
@@ -986,14 +988,17 @@ def main():
     best_acc = 0
     pbar = tqdm.tqdm(total=EPOCHS, desc='Training Progress', position=0)
   
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     
+
     for epoch in range(EPOCHS):
         # Training
-        train_loss, train_acc, unique_images = train_epoch(
-            model, train_loader, criterion, optimizer, epoch)
+        train_loss, train_acc = train_epoch(
+            model, train_loader, criterion, optimizer, epoch, device)
         
         # Validation
-        test_loss, test_acc = evaluate(model, test_loader, criterion)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         
         # Step scheduler
         scheduler.step()

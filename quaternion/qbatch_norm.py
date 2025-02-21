@@ -302,53 +302,35 @@ class IQBN(nn.Module):
         assert Q == 4, "Expected quaternion input with 4 components"
         assert C == self.num_features, f"Expected {self.num_features} quaternion channels, got {C}"
 
-        # Move buffers to same device as input
-        device = x.device
-        self.running_mean = self.running_mean.to(device)
-        self.running_var = self.running_var.to(device)
-        self.num_batches_tracked = self.num_batches_tracked.to(device)
-        
-        # Flatten spatial dimensions for stats computation
-        x_reshaped = x.transpose(1, 2).reshape(B, Q, C, -1)  # [B, Q, C, H*W]
-        
-        if self.training:
-            # Compute stats per channel and quaternion component
-            mean = x_reshaped.mean(dim=(0, -1))  # [Q, C]
-            var = x_reshaped.var(dim=(0, -1), unbiased=False)  # [Q, C]
-            
-            if self.num_batches_tracked == 0:
-                # Initialize running stats on first batch
-                self.running_mean.copy_(mean.t().detach())
-                self.running_var.copy_(var.t().detach())
-            else:
-                # Update running stats
-                self.running_mean.mul_(1 - self.momentum).add_(mean.t().detach() * self.momentum)
-                self.running_var.mul_(1 - self.momentum).add_(var.t().detach() * self.momentum)
-            
-            self.num_batches_tracked += 1
-        else:
-            mean = self.running_mean.t()  # [Q, C]
-            var = self.running_var.t()  # [Q, C]
+        if not self.training:
+            # Use running stats during eval (more efficient)
+            mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
+            var = self.running_var.view(1, self.num_features, 4, 1, 1)
+            x = (x - mean) / (var + self.eps).sqrt()
+            return x * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
 
-        # Reshape stats for normalization
-        mean = mean.view(1, Q, C, 1)  # [1, Q, C, 1]
-        var = var.view(1, Q, C, 1)  # [1, Q, C, 1]
+        # Training mode
+        x_reshaped = x.transpose(1, 2).reshape(B, Q, C, -1)
         
-        # Normalize while preserving quaternion structure
+        # Compute batch statistics
+        mean = x_reshaped.mean(dim=(0, -1))  # [Q, C]
+        var = x_reshaped.var(dim=(0, -1), unbiased=False)  # [Q, C]
+        
+        # Update running stats
+        with torch.no_grad():
+            self.running_mean = self.running_mean * (1 - self.momentum) + mean.t() * self.momentum
+            self.running_var = self.running_var * (1 - self.momentum) + var.t() * self.momentum
+            self.num_batches_tracked += 1
+        
+        # Normalize and apply parameters
+        mean = mean.view(1, Q, C, 1)
+        var = var.view(1, Q, C, 1)
         x_norm = (x_reshaped - mean) / (var + self.eps).sqrt()
+        x_norm = x_norm * self.gamma.t().view(1, Q, C, 1) + self.beta.t().view(1, Q, C, 1)
         
-        # Apply learnable parameters (ensure they're on correct device)
-        gamma = self.gamma.to(device).t().view(1, Q, C, 1)  # [1, Q, C, 1]
-        beta = self.beta.to(device).t().view(1, Q, C, 1)  # [1, Q, C, 1]
-        x_norm = x_norm * gamma + beta
-        
-        # Restore original shape
         return x_norm.reshape(B, Q, C, H, W).transpose(1, 2)
 
 
-
-
-# class IQBN(nn.Module):
 #     """
 #     Quaternion Batch Normalization with careful running stats management
 #     """
