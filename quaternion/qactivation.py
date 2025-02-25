@@ -114,6 +114,29 @@ class QPReLU(nn.Module):
         # Stack components back together
         return torch.stack([x_r, x_i, x_j, x_k], dim=2)
 
+class QSiLU(nn.Module):
+    """
+    Split Quaternion SiLU (Swish) Activation Function.
+    Applies SiLU to each quaternion component separately, following QPReLU's approach.
+    """
+    def __init__(self):
+        super(QSiLU, self).__init__()
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Create output tensor
+        out = torch.zeros_like(x)
+        
+        # Copy real component unchanged
+        # out[:,:,0,:,:] = x[:,:,0,:,:]
+        
+        # Apply SiLU to imaginary components
+        imag_parts = x[:,:,0:,:,:]
+        out[:,:,0:,:,:] = imag_parts * self.sigmoid(imag_parts)
+        
+        return out
+
+
 class QREReLU(nn.Module):
     """
     Quaternion Rotation-Equivariant ReLU Activation Function.

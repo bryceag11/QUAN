@@ -79,8 +79,8 @@ def count_parameters(model):
 
 
 # Configuration
-BATCH_SIZE = 128
-NUM_CLASSES = 100
+BATCH_SIZE = 256
+NUM_CLASSES = 10
 EPOCHS = 300
 LEARNING_RATE = 0.001
 BETA_1 = 0.9
@@ -783,220 +783,75 @@ class QuaternionCIFAR10(nn.Module):
         
         return real_components
 
-class Cutout:
-    """Randomly mask out a square patch from an image.
-    
-    Args:
-        n_holes (int): Number of square patches to cut out.
-        length (int): Length of the square side.
-    """
-    def __init__(self, n_holes=1, length=16):
-        self.n_holes = n_holes
-        self.length = length
+def seed_worker(worker_id):
+    worker_seed = torch.initial_seed() % 2**32  # Get seed from the initial seed
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
-    def __call__(self, img):
-        """
-        Args:
-            img (Tensor): Tensor image of shape (C, H, W).
-        
-        Returns:
-            Tensor: Image with n_holes of specified length cut out.
-        """
-        h = img.size(1)
-        w = img.size(2)
-
-        mask = torch.ones((h, w), device=img.device)
-
-        for n in range(self.n_holes):
-            y = torch.randint(0, h, (1,))
-            x = torch.randint(0, w, (1,))
-
-            y1 = torch.clamp(y - self.length // 2, 0, h)
-            y2 = torch.clamp(y + self.length // 2, 0, h)
-            x1 = torch.clamp(x - self.length // 2, 0, w)
-            x2 = torch.clamp(x + self.length // 2, 0, w)
-
-            mask[y1:y2, x1:x2] = 0.
-
-        mask = mask.expand_as(img)
-        img = img * mask
-
-        return img
-
-def visualize_feature_maps_to_disk(model, val_batch, epoch, output_dir):
-    """
-    Visualizes and saves feature maps to a directory
-    
-    Args:
-        model: The model to visualize
-        val_batch: A batch of validation data
-        epoch: Current epoch number
-        output_dir: Directory to save visualizations
-    """
-    import os
-    import matplotlib.pyplot as plt
-    import numpy as np
-    
-    # Only visualize every 10 epochs to avoid too many files
-    if epoch % 10 != 0:
-        return
-    
-    # Create output directory if it doesn't exist
-    feature_maps_dir = os.path.join(output_dir, f'feature_maps/epoch_{epoch}')
-    os.makedirs(feature_maps_dir, exist_ok=True)
-    
-    model.eval()
-    with torch.no_grad():
-        # Get first 8 images from batch
-        images = val_batch[0][:8].to(DEVICE)
-        
-        # Forward pass through model layers
-        # For QResNet34:
-        x = model.conv1(images)
-        
-        # Save conv1 feature maps
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(10, 10))
-            # Get real part of quaternion features (first component)
-            features = x[i, :, 0, :, :].cpu().mean(dim=0).numpy()
-            
-            # Normalize for better visualization
-            features = (features - features.min()) / (features.max() - features.min() + 1e-8)
-            
-            ax.imshow(features, cmap='viridis')
-            ax.set_title(f'Sample {i} - Conv1 Features')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_conv1.png'), dpi=150)
-            plt.close(fig)
-        
-        # After conv2_x
-        x = model.conv2_x(x)
-        
-        # Save conv2 feature maps
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(10, 10))
-            features = x[i, :, 0, :, :].cpu().mean(dim=0).numpy()
-            features = (features - features.min()) / (features.max() - features.min() + 1e-8)
-            
-            ax.imshow(features, cmap='viridis')
-            ax.set_title(f'Sample {i} - Conv2 Features')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_conv2.png'), dpi=150)
-            plt.close(fig)
-        
-        # After conv3_x
-        x = model.conv3_x(x)
-        
-        # Save conv3 feature maps
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(10, 10))
-            features = x[i, :, 0, :, :].cpu().mean(dim=0).numpy()
-            features = (features - features.min()) / (features.max() - features.min() + 1e-8)
-            
-            ax.imshow(features, cmap='viridis')
-            ax.set_title(f'Sample {i} - Conv3 Features')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_conv3.png'), dpi=150)
-            plt.close(fig)
-            
-        # After conv4_x
-        x = model.conv4_x(x)
-        
-        # Save conv4 feature maps
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(10, 10))
-            features = x[i, :, 0, :, :].cpu().mean(dim=0).numpy()
-            features = (features - features.min()) / (features.max() - features.min() + 1e-8)
-            
-            ax.imshow(features, cmap='viridis')
-            ax.set_title(f'Sample {i} - Conv4 Features')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_conv4.png'), dpi=150)
-            plt.close(fig)
-            
-        # After conv5_x
-        x = model.conv5_x(x)
-        
-        # Save conv5 feature maps
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(10, 10))
-            features = x[i, :, 0, :, :].cpu().mean(dim=0).numpy()
-            features = (features - features.min()) / (features.max() - features.min() + 1e-8)
-            
-            ax.imshow(features, cmap='viridis')
-            ax.set_title(f'Sample {i} - Conv5 Features')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_conv5.png'), dpi=150)
-            plt.close(fig)
-            
-        # Also save input images for reference
-        for i in range(min(8, images.shape[0])):
-            fig, ax = plt.subplots(figsize=(5, 5))
-            # Denormalize the image
-            img = images[i].cpu().permute(1, 2, 0).numpy()
-            img = np.clip(img * np.array([0.2675, 0.2565, 0.2761]) + np.array([0.5071, 0.4867, 0.4408]), 0, 1)
-            
-            ax.imshow(img)
-            ax.set_title(f'Sample {i} - Input Image')
-            ax.axis('off')
-            plt.tight_layout()
-            plt.savefig(os.path.join(feature_maps_dir, f'sample_{i}_input.png'), dpi=150)
-            plt.close(fig)
-            
-    print(f"Feature maps for epoch {epoch} saved to {feature_maps_dir}")
+def set_random_seeds(seed=42):
+    """Set random seeds for reproducibility"""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # For multi-GPU
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 class MultiAugmentDataset(torch.utils.data.Dataset):
     """Dataset wrapper that applies multiple augmentations to each image"""
-    def __init__(self, dataset, augmentations_per_image=3, train=True):
+    def __init__(self, dataset, augmentations_per_image=3, train=True, seed=42):
         self.dataset = dataset
         self.augmentations_per_image = augmentations_per_image
         self.train = train
+        self.rng = np.random.RandomState(seed)  # Local RNG for transforms
         
         # Import AutoAugment for CIFAR10
         from torchvision.transforms import AutoAugment, AutoAugmentPolicy
         
-        # Strong augmentation with AutoAugment and Cutout
+        # Create deterministic transforms
         self.strong_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             AutoAugment(AutoAugmentPolicy.CIFAR10),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
-                                (0.2675, 0.2565, 0.2761)),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
+                               (0.2023, 0.1994, 0.2010)),
             Cutout(n_holes=1, length=16)
         ])
         
-        # Weak augmentation with just basic transforms
         self.weak_transform = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
-                                (0.2675, 0.2565, 0.2761))
+            transforms.Normalize((0.4914, 0.4822, 0.4465), 
+                               (0.2023, 0.1994, 0.2010))
         ])
         
-        # Test transform
         self.test_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), 
                                (0.2023, 0.1994, 0.2010))
         ])
         
-        # Pre-compute augmentation indices for efficiency
+        # Pre-compute indices with fixed random state
         if self.train:
             self.indices = []
             for idx in range(len(dataset)):
                 self.indices.extend([idx] * augmentations_per_image)
+            
+            # Shuffle indices deterministically
+            self.rng.shuffle(self.indices)
 
     def __getitem__(self, index):
         if self.train:
             real_idx = self.indices[index]
             image, label = self.dataset[real_idx]
+            
+            # Set the random state based on index for reproducible augmentations
+            torch.manual_seed(index)
             
             # First augmentation is always weak, others are strong
             if index % self.augmentations_per_image == 0:
@@ -1014,48 +869,94 @@ class MultiAugmentDataset(torch.utils.data.Dataset):
             return len(self.dataset) * self.augmentations_per_image
         return len(self.dataset)
 
-def get_data_loaders(batch_size=128, augmentations_per_image=1, num_workers=1):
-    """Get train and test data loaders with multiple augmentations"""
+class Cutout:
+    """Randomly mask out a square patch from an image."""
+    def __init__(self, n_holes=1, length=16):
+        self.n_holes = n_holes
+        self.length = length
+
+    def __call__(self, img):
+        h = img.size(1)
+        w = img.size(2)
+        
+        # Use deterministic random state based on image content
+        state = torch.get_rng_state()
+        
+        mask = torch.ones((h, w), device=img.device)
+        for n in range(self.n_holes):
+            y = torch.randint(0, h, (1,))
+            x = torch.randint(0, w, (1,))
+
+            y1 = torch.clamp(y - self.length // 2, 0, h)
+            y2 = torch.clamp(y + self.length // 2, 0, h)
+            x1 = torch.clamp(x - self.length // 2, 0, w)
+            x2 = torch.clamp(x + self.length // 2, 0, w)
+
+            mask[y1:y2, x1:x2] = 0.
+
+        mask = mask.expand_as(img)
+        img = img * mask
+        
+        # Restore random state
+        torch.set_rng_state(state)
+        
+        return img
+
+def get_data_loaders(batch_size=256, augmentations_per_image=1, num_workers=1, seed=42):
+    """Get train and test data loaders with reproducible augmentations"""
+    
+    # Set global random seeds
+    set_random_seeds(seed)
+    
+    # Create generator with fixed seed
+    g = torch.Generator()
+    g.manual_seed(seed)
     
     # Load base CIFAR-10 dataset
-    trainset = torchvision.datasets.CIFAR100(
+    trainset = torchvision.datasets.CIFAR10(
         root='./data', train=True, download=True, transform=None)
-    testset = torchvision.datasets.CIFAR100(
+    testset = torchvision.datasets.CIFAR10(
         root='./data', train=False, download=True, transform=None)
     
     # Wrap datasets with multi-augmentation
     train_dataset = MultiAugmentDataset(
         trainset, 
         augmentations_per_image=augmentations_per_image,
-        train=True
+        train=True,
+        seed=seed
     )
     test_dataset = MultiAugmentDataset(
         testset,
-        augmentations_per_image=1,  # No augmentation for test
-        train=False
+        augmentations_per_image=1,
+        train=False,
+        seed=seed
     )
     
-    # Create data loaders
+    # Create data loaders with fixed seeds
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,  
-        persistent_workers=True,  
+        worker_init_fn=seed_worker,  # Use the module-level function
+        generator=g,
+        pin_memory=True,
+        persistent_workers=True,
         prefetch_factor=3,
         drop_last=True
-    ) 
+    )
     
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,  
-        persistent_workers=True, 
+        worker_init_fn=seed_worker,  # Use the module-level function
+        generator=g,
+        pin_memory=True,
+        persistent_workers=True,
         prefetch_factor=3,
-        drop_last=True 
+        drop_last=True
     )
     
     return train_loader, test_loader
@@ -1137,9 +1038,9 @@ def main():
         os.makedirs(SAVE_DIR)
     
     # Constants for augmentation
-    NUM_AUGMENTATIONS = 3  # Number of augmentations per image
-    # RANDOM_SEED = 42
-    # set_random_seeds(RANDOM_SEED)
+    NUM_AUGMENTATIONS = 1  # Number of augmentations per image
+    RANDOM_SEED = 42
+    set_random_seeds(RANDOM_SEED)
     # Initialize logging
     writer = SummaryWriter('runs/quaternion_densenet')
     metrics_logger = MetricsLogger(SAVE_DIR)
@@ -1147,11 +1048,12 @@ def main():
     # Get dataloaders with augmentation
     train_loader, test_loader = get_data_loaders(
         batch_size=BATCH_SIZE,
-        augmentations_per_image=2,
-        num_workers=1,
+        augmentations_per_image=1,
+        num_workers=4,
+        seed=RANDOM_SEED
     )
     # model = ResNet34(num_classes=10)
-    model = QResNet34(num_classes=100, mapping_type='poincare')
+    model = QResNet34(num_classes=10, mapping_type='poincare')
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
@@ -1160,7 +1062,7 @@ def main():
     optimizer = torch.optim.SGD(model.parameters(), 
                             lr=0.1,
                             momentum=0.9, 
-                            weight_decay=5e-4,
+                            weight_decay=1e-4,
                             nesterov=True)
     
 
@@ -1168,7 +1070,7 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[150, 225],
+        milestones=[75, 150, 225],
         gamma=0.1,
     )
 
@@ -1182,9 +1084,7 @@ def main():
   
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
-    feature_maps_dir = os.path.join(SAVE_DIR, 'feature_maps')
-    os.makedirs(feature_maps_dir, exist_ok=True)
-    val_batch = next(iter(test_loader))
+    
 
     for epoch in range(EPOCHS):
         # Training
@@ -1193,7 +1093,7 @@ def main():
         
         # Validation
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-        visualize_feature_maps_to_disk(model, val_batch, epoch, SAVE_DIR)
+        
         # Step scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]

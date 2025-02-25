@@ -283,52 +283,52 @@ class QBN(nn.Module):
 class IQBN(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
         super().__init__()
-        # Adjust features for quaternion structure
         self.num_features = num_features // 4
         self.eps = eps
         self.momentum = momentum
-
-        # Create parameters
+        
+        # Parameters reshaped for correct broadcasting
         self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
         self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
         
-        # Register buffers with correct shapes
+        # Running stats with correct shapes
         self.register_buffer('running_mean', torch.zeros(self.num_features, 4))
         self.register_buffer('running_var', torch.ones(self.num_features, 4))
-        self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
+        # Quick validation
+        if x.size(2) != 4:
+            raise ValueError("Expected quaternion input with 4 components")
+            
         B, C, Q, H, W = x.shape
-        assert Q == 4, "Expected quaternion input with 4 components"
-        assert C == self.num_features, f"Expected {self.num_features} quaternion channels, got {C}"
-
+            
         if not self.training:
-            # Use running stats during eval (more efficient)
+            # Eval mode - use running stats
             mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
             var = self.running_var.view(1, self.num_features, 4, 1, 1)
-            x = (x - mean) / (var + self.eps).sqrt()
-            return x * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-
+            x_norm = (x - mean) / (var + self.eps).sqrt()
+            return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
+            
         # Training mode
-        x_reshaped = x.transpose(1, 2).reshape(B, Q, C, -1)
+        # Reshape for efficient stat computation while preserving quaternion structure
+        x_reshaped = x.permute(0, 3, 4, 1, 2).reshape(-1, self.num_features, 4)
         
         # Compute batch statistics
-        mean = x_reshaped.mean(dim=(0, -1))  # [Q, C]
-        var = x_reshaped.var(dim=(0, -1), unbiased=False)  # [Q, C]
+        mean = x_reshaped.mean(dim=0)  # [C, 4]
+        var = x_reshaped.var(dim=0, unbiased=False)  # [C, 4]
         
         # Update running stats
         with torch.no_grad():
-            self.running_mean = self.running_mean * (1 - self.momentum) + mean.t() * self.momentum
-            self.running_var = self.running_var * (1 - self.momentum) + var.t() * self.momentum
-            self.num_batches_tracked += 1
+            self.running_mean = self.running_mean * (1 - self.momentum) + mean * self.momentum
+            self.running_var = self.running_var * (1 - self.momentum) + var * self.momentum
         
-        # Normalize and apply parameters
-        mean = mean.view(1, Q, C, 1)
-        var = var.view(1, Q, C, 1)
-        x_norm = (x_reshaped - mean) / (var + self.eps).sqrt()
-        x_norm = x_norm * self.gamma.t().view(1, Q, C, 1) + self.beta.t().view(1, Q, C, 1)
+        # Normalize
+        mean = mean.view(1, self.num_features, 4, 1, 1)
+        var = var.view(1, self.num_features, 4, 1, 1)
+        x_norm = (x - mean) / (var + self.eps).sqrt()
         
-        return x_norm.reshape(B, Q, C, H, W).transpose(1, 2)
+        # Apply learnable parameters
+        return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
 
 
 #     """

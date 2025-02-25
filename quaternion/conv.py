@@ -35,197 +35,6 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
 #         return (k - 1) // 2
 #     return p
 
-# class Conv(nn.Module):
-#     default_act = nn.SiLU()  # default activation
-
-#     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
-#         """Initialize Conv layer with given arguments including activation."""
-#         super().__init__()
-#         self.conv = QConv2D(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
-#         self.bn = IQBN(c2)
-#         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
-
-#     def forward(self, x):
-#         """Apply convolution, batch normalization and activation to input tensor."""
-#         # print(f"X type: {x.dtype}")
-#         return self.act(self.bn(self.conv(x)))
-
-#     def forward_fuse(self, x):
-#         """Apply convolution and activation without batch normalization."""
-#         return self.act(self.conv(x))
-
-# class DWConv(Conv):
-#     """Depth-wise convolution."""
-
-#     def __init__(self, c1, c2, k=1, s=1, d=1, act=True):  # ch_in, ch_out, kernel, stride, dilation, activation
-#         """Initialize Depth-wise convolution with given parameters."""
-#         super().__init__(c1, c2, k, s, g=math.gcd(c1//4, c2//4), d=d, act=act)
-# Geometric
-# class QConv(nn.Module):
-#     def __init__(self, 
-#                  rank: int,
-#                  in_channels: int,
-#                  out_channels: int,
-#                  kernel_size: Union[int, Tuple[int, ...]],
-#                  stride: Union[int, Tuple[int, ...]] = 1,
-#                  padding: Union[str, int, Tuple[int, ...]] = 0,
-#                  dilation: Union[int, Tuple[int, ...]] = 1,
-#                  groups: int = 1,
-#                  bias: bool = True,
-#                  padding_mode: str = 'zeros',
-#                  device=None,
-#                  dtype=None) -> None:
-#         super(QConv, self).__init__()
-        
-#         self.device = device if device is not None else ('cuda' if torch.cuda.is_available() else 'cpu')
-#         assert rank in [1, 2, 3], "rank must be 1, 2, or 3"
-        
-#         self.rank = rank
-#         self.in_channels = in_channels
-#         self.out_channels = out_channels
-#         self.groups = groups
-#         self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size,) * rank
-        
-#         if rank == 1:
-#             Conv = nn.Conv1d
-#         elif rank == 2:
-#             Conv = nn.Conv2d
-#         else:
-#             Conv = nn.Conv3d
-            
-#         self.is_first_layer = (in_channels == 3)
-        
-#         if self.is_first_layer:
-#             actual_in_channels = 1
-#         else:
-#             assert in_channels % 4 == 0, "in_channels must be multiple of 4 for non-first layers"
-#             actual_in_channels = in_channels // 4
-            
-#         assert out_channels % 4 == 0, "out_channels must be multiple of 4"
-#         out_channels_quat = out_channels // 4
-        
-#         # Create separate convolutions for each geometric component
-#         self.conv_r = Conv(actual_in_channels, out_channels_quat, kernel_size,
-#                           stride, padding, dilation, groups, bias, 
-#                           padding_mode, device=self.device, dtype=dtype)
-        
-#         self.conv_i = Conv(actual_in_channels, out_channels_quat, kernel_size,
-#                           stride, padding, dilation, groups, False, 
-#                           padding_mode, device=self.device, dtype=dtype)
-        
-#         self.conv_j = Conv(actual_in_channels, out_channels_quat, kernel_size,
-#                           stride, padding, dilation, groups, False, 
-#                           padding_mode, device=self.device, dtype=dtype)
-        
-#         self.conv_k = Conv(actual_in_channels, out_channels_quat, kernel_size,
-#                           stride, padding, dilation, groups, False, 
-#                           padding_mode, device=self.device, dtype=dtype)
-        
-#         # Learnable rotation parameters
-#         self.theta = nn.Parameter(torch.Tensor(out_channels_quat))
-#         self.axis_x = nn.Parameter(torch.Tensor(out_channels_quat))
-#         self.axis_y = nn.Parameter(torch.Tensor(out_channels_quat))
-#         self.axis_z = nn.Parameter(torch.Tensor(out_channels_quat))
-        
-#         self._initialize_weights()
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         x = x.to(self.device)
-        
-#         if x.size(1) == 3:
-#             x = self.rgb_to_quaternion(x)
-        
-#         if self.is_first_layer:
-#             B, Q, H, W = x.shape
-#             assert Q == 4, "First layer input must have 4 quaternion components"
-            
-#             # Process each component independently
-#             r_conv = self.conv_r(x[:, 0:1])
-#             i_conv = self.conv_i(x[:, 1:2])
-#             j_conv = self.conv_j(x[:, 2:3])
-#             k_conv = self.conv_k(x[:, 3:4])
-#         else:
-#             # For subsequent layers, input shape is [B, C, Q, H, W]
-#             x_r = x[:, :, 0, :, :]  # shape: [B, C_q, H, W]
-#             x_i = x[:, :, 1, :, :]
-#             x_j = x[:, :, 2, :, :]
-#             x_k = x[:, :, 3, :, :]
-            
-#             # Independent convolutions
-#             r_conv = self.conv_r(x_r)
-#             i_conv = self.conv_i(x_i)
-#             j_conv = self.conv_j(x_j)
-#             k_conv = self.conv_k(x_k)
-        
-#         # Get output shape
-#         B, C, H, W = r_conv.shape
-        
-#         # Normalize rotation axis
-#         axis_norm = torch.sqrt(self.axis_x**2 + self.axis_y**2 + self.axis_z**2)
-#         u_x = (self.axis_x / axis_norm).view(1, -1, 1, 1)
-#         u_y = (self.axis_y / axis_norm).view(1, -1, 1, 1)
-#         u_z = (self.axis_z / axis_norm).view(1, -1, 1, 1)
-        
-#         # Compute rotation quaternion components
-#         theta = self.theta.view(1, -1, 1, 1)
-#         cos_half_theta = torch.cos(theta / 2)
-#         sin_half_theta = torch.sin(theta / 2)
-        
-#         # Apply geometric transformation
-#         # First rotation
-#         out_r = cos_half_theta * r_conv - sin_half_theta * (u_x * i_conv + u_y * j_conv + u_z * k_conv)
-#         out_i = cos_half_theta * i_conv + sin_half_theta * (u_x * r_conv + u_y * k_conv - u_z * j_conv)
-#         out_j = cos_half_theta * j_conv + sin_half_theta * (u_y * r_conv - u_x * k_conv + u_z * i_conv)
-#         out_k = cos_half_theta * k_conv + sin_half_theta * (u_z * r_conv + u_x * j_conv - u_y * i_conv)
-        
-#         # Stack outputs
-#         out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
-        
-#         # Clean up intermediate tensors
-#         del r_conv, i_conv, j_conv, k_conv
-        
-#         return out
-
-#     def rgb_to_quaternion(self, x):
-#         """Convert RGB input to quaternion format [B, 4, H, W]"""
-#         rgb_normalized = (x - x.min()) / (x.max() - x.min() + 1e-8)
-        
-#         return torch.cat([
-#             rgb_normalized.mean(dim=1, keepdim=True),  # real part
-#             rgb_normalized[:, 0:1],  # R -> i
-#             rgb_normalized[:, 1:2],  # G -> j
-#             rgb_normalized[:, 2:3]   # B -> k
-#         ], dim=1)
-
-#     def _initialize_weights(self):
-#         # Calculate fan_in
-#         kernel_prod = np.prod(self.kernel_size)
-#         fan_in = (self.in_channels // 4 if not self.is_first_layer else 1) * kernel_prod
-        
-#         # Initialize convolution weights
-#         nn.init.kaiming_uniform_(self.conv_r.weight, a=math.sqrt(5))
-#         if self.conv_r.bias is not None:
-#             bound = 1 / math.sqrt(fan_in)
-#             nn.init.uniform_(self.conv_r.bias, -bound, bound)
-        
-#         # Initialize imaginary convolutions with smaller weights
-#         scale = 0.5
-#         for conv in [self.conv_i, self.conv_j, self.conv_k]:
-#             nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scale)
-        
-#         # Initialize geometric parameters
-#         nn.init.uniform_(self.theta, -math.pi/4, math.pi/4)
-#         nn.init.uniform_(self.axis_x, -1, 1)
-#         nn.init.uniform_(self.axis_y, -1, 1)
-#         nn.init.uniform_(self.axis_z, -1, 1)
-        
-#         # Normalize rotation axis
-#         with torch.no_grad():
-#             norm = torch.sqrt(self.axis_x**2 + self.axis_y**2 + self.axis_z**2)
-#             self.axis_x.div_(norm)
-#             self.axis_y.div_(norm)
-#             self.axis_z.div_(norm)
-
 class QConv(nn.Module):
     """
     Base Quaternion Convolution class.
@@ -370,7 +179,7 @@ class QConv(nn.Module):
     #     for i, conv in enumerate(convs):
     #         nn.init.kaiming_uniform_(conv.weight, a=math.sqrt(5) * scales[i+1])
 
-# Bias for all layers weight init
+    # Bias for all layers weight init
     def _initialize_weights(self):
         
         kernel_prod = np.prod(self.kernel_size)
@@ -378,9 +187,11 @@ class QConv(nn.Module):
         
         # Scale factors for quaternion components
         scale_factors = {
-            'luminance': [1.0, 0.5, 0.5, 0.5],      # Emphasize real component
+            'luminance': [1.0, 1.0, 1.0, 1.0],      # Emphasize real component
             'mean_brightness': [1.0, 0.75, 0.75, 0.75],  # Slightly more balanced
-            'raw_normalized': [1.0, 1.0, 1.0, 1.0]  # Equal emphasis
+            'raw_normalized': [1.0, 0.5, 0.5, 0.5],  # Equal emphasis
+            'poincare': [1.0, 1.0, 1.0, 1.0]  # Equal emphasis
+
         }
         scales = scale_factors.get(self.mapping_type, [0.5, 0.5, 0.5, 0.5])
         
@@ -398,63 +209,36 @@ class QConv(nn.Module):
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-
-        # Handle RGB input conversion for first layer
-        if x.size(1) == 3:  # RGB input
-            with torch.no_grad():  # Prevent memory accumulation during conversion
-                x = self.rgb_to_quaternion(x)
-        
-        if self.is_first_layer:
-            B, Q, H, W = x.shape
-            assert Q == 4, "First layer input must have 4 quaternion components"
+            if x.size(1) == 3:  # RGB input
+                with torch.no_grad():
+                    x = self.rgb_to_quaternion(x)
             
-            # Process each component independently
-            r_conv = self.conv_r(x[:, 0:1])
-            i_conv = self.conv_i(x[:, 1:2])
-            j_conv = self.conv_j(x[:, 2:3])
-            k_conv = self.conv_k(x[:, 3:4])
-        else:
-            # For subsequent layers, input shape is [B, C, Q, H, W]
-            x_r = x[:, :, 0, :, :]  # shape: [B, C_q, H, W]
-            x_i = x[:, :, 1, :, :]
-            x_j = x[:, :, 2, :, :]
-            x_k = x[:, :, 3, :, :]
+            if self.is_first_layer:
+                B, Q, H, W = x.shape
+                assert Q == 4, "First layer input must have 4 quaternion components"
+                r_conv = self.conv_r(x[:, 0:1])
+                i_conv = self.conv_i(x[:, 1:2])
+                j_conv = self.conv_j(x[:, 2:3])
+                k_conv = self.conv_k(x[:, 3:4])
+            else:
+                x_r = x[:, :, 0, :, :]
+                x_i = x[:, :, 1, :, :]
+                x_j = x[:, :, 2, :, :]
+                x_k = x[:, :, 3, :, :]
+                r_conv = self.conv_r(x_r)
+                i_conv = self.conv_i(x_i)
+                j_conv = self.conv_j(x_j)
+                k_conv = self.conv_k(x_k)
             
-            # Independent convolutions for each component
-            r_conv = self.conv_r(x_r)
-            i_conv = self.conv_i(x_i)
-            j_conv = self.conv_j(x_j)
-            k_conv = self.conv_k(x_k)
-        
-        # Hamilton product mixing - same for both cases
-        # Use in-place operations where possible
-        out_r = r_conv
-        out_r.sub_(i_conv)
-        out_r.sub_(j_conv)
-        out_r.sub_(k_conv)
-        
-        out_i = r_conv.clone()
-        out_i.add_(i_conv)
-        out_i.add_(j_conv)
-        out_i.sub_(k_conv)
-        
-        out_j = r_conv.clone()
-        out_j.sub_(i_conv)
-        out_j.add_(j_conv)
-        out_j.add_(k_conv)
-        
-        out_k = r_conv.clone()
-        out_k.add_(i_conv)
-        out_k.sub_(j_conv)
-        out_k.add_(k_conv)
-        
-        # Stack outputs
-        out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
-        
-        # Clean up intermediate tensors
-        del r_conv, i_conv, j_conv, k_conv
-        
-        return out
+            # Compute outputs without cloning
+            out_r = r_conv - i_conv - j_conv - k_conv
+            out_i = r_conv + i_conv + j_conv - k_conv
+            out_j = r_conv - i_conv + j_conv + k_conv
+            out_k = r_conv + i_conv - j_conv + k_conv
+            
+            out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
+            del r_conv, i_conv, j_conv, k_conv
+            return out
     
     def rgb_to_quaternion(self, rgb_input):
         B, C, H, W = rgb_input.shape
@@ -578,7 +362,7 @@ class QDense(nn.Module):
                  in_features: int, 
                  out_features: int, 
                  bias: bool = True,
-                 mapping_type: str = 'raw_normalized',
+                 mapping_type: str = 'poincare',
                  device=None,
                  dtype=None):
         super(QDense, self).__init__()
@@ -601,60 +385,57 @@ class QDense(nn.Module):
         
         # Create separate linear layers for each quaternion component
         self.linear_rr = nn.Linear(in_features_quat, out_features_quat, bias=bias)
-        self.linear_ri = nn.Linear(in_features_quat, out_features_quat, bias=False)
-        self.linear_rj = nn.Linear(in_features_quat, out_features_quat, bias=False)
-        self.linear_rk = nn.Linear(in_features_quat, out_features_quat, bias=False)
+        self.linear_ri = nn.Linear(in_features_quat, out_features_quat, bias=bias)
+        self.linear_rj = nn.Linear(in_features_quat, out_features_quat, bias=bias)
+        self.linear_rk = nn.Linear(in_features_quat, out_features_quat, bias=bias)
         
         # Initialize weights
         self._initialize_weights()
     
     def rgb_to_quaternion(self, rgb_input):
-        """Convert RGB to quaternion-like representation"""
-        B, C = rgb_input.shape
+        B, C, H, W = rgb_input.shape
+        luminance = (0.299 * rgb_input[:, 0] + 0.587 * rgb_input[:, 1] + 0.114 * rgb_input[:, 2]).unsqueeze(1).to(rgb_input.device)
+        mean_brightness = rgb_input.mean(dim=1, keepdim=True).to(rgb_input.device)
+        rgb_normalized = ((rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min())).to(rgb_input.device)
         
-        # Luminance-based
-        luminance = (0.299 * rgb_input[:, 0] + 
-                     0.587 * rgb_input[:, 1] + 
-                     0.114 * rgb_input[:, 2]).unsqueeze(1)
+        def hamilton_mapping(x):
+            real = torch.zeros_like(x[:, 0:1]).to(x.device)
+            return torch.cat([real, x[:, 0:1], x[:, 1:2], x[:, 2:3]], dim=1)
         
-        # Mean Brightness
-        mean_brightness = rgb_input.mean(dim=1, keepdim=True)
+        def poincare_mapping(x):
+            norm = torch.norm(x, dim=1, keepdim=True)
+            x_normalized = (x / (norm + 1)).to(x.device)
+            return torch.cat([torch.sqrt(1 - torch.sum(x_normalized**2, dim=1, keepdim=True)), 
+                            x_normalized[:, 0:1], x_normalized[:, 1:2], x_normalized[:, 2:3]], dim=1)
         
-        # Normalized Channels
-        rgb_normalized = (rgb_input - rgb_input.min()) / (rgb_input.max() - rgb_input.min())
-        
-        # Mapping strategies
         mappings = {
-            'luminance': torch.cat([luminance, 
-                                     rgb_normalized[:, 0:1], 
-                                     rgb_normalized[:, 1:2], 
-                                     rgb_normalized[:, 2:3]], dim=1),
-            
-            'mean_brightness': torch.cat([mean_brightness, 
-                                           rgb_input[:, 0:1], 
-                                           rgb_input[:, 1:2], 
-                                           rgb_input[:, 2:3]], dim=1),
-            
+            'luminance': torch.cat([luminance, rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
+            'mean_brightness': torch.cat([mean_brightness, rgb_input[:, 0:1], rgb_input[:, 1:2], rgb_input[:, 2:3]], dim=1),
             'raw_normalized': torch.cat([rgb_normalized.mean(dim=1, keepdim=True), 
-                                          rgb_normalized[:, 0:1], 
-                                          rgb_normalized[:, 1:2], 
-                                          rgb_normalized[:, 2:3]], dim=1)
+                                        rgb_normalized[:, 0:1], rgb_normalized[:, 1:2], rgb_normalized[:, 2:3]], dim=1),
+            'hamilton': hamilton_mapping(rgb_input),
+            'poincare': poincare_mapping(rgb_input)
         }
-        
         return mappings[self.mapping_type]
     
     def _initialize_weights(self):
-        # Similar to convolution initialization
-        for linear in [self.linear_rr, self.linear_ri, self.linear_rj, self.linear_rk]:
-            nn.init.kaiming_uniform_(linear.weight, a=math.sqrt(5))
-            if linear.bias is not None:
+            import math
+            
+            scale_factors = {
+                'luminance': [1.0, 1.0, 1.0, 1.0],
+                'mean_brightness': [1.0, 0.75, 0.75, 0.75],
+                'raw_normalized': [1.0, 0.5, 0.5, 0.5],
+                'poincare': [1.0, 1.0, 1.0, 1.0]
+            }
+            scales = scale_factors.get(self.mapping_type, [0.5, 0.5, 0.5, 0.5])
+            
+            linears = [self.linear_rr, self.linear_ri, self.linear_rj, self.linear_rk]
+            for i, linear in enumerate(linears):
                 fan_in, _ = nn.init._calculate_fan_in_and_fan_out(linear.weight)
-                bound = 1 / math.sqrt(fan_in)
-                nn.init.uniform_(linear.bias, -bound, bound)
-        
-        # Scale down weights for imaginary components
-        for linear in [self.linear_ri, self.linear_rj, self.linear_rk]:
-            linear.weight.data *= 0.5
+                nn.init.kaiming_uniform_(linear.weight, a=math.sqrt(5) * scales[i])
+                if linear.bias is not None:
+                    bound = 1 / math.sqrt(fan_in) * scales[i]
+                    nn.init.uniform_(linear.bias, -bound, bound)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.size(1) == 3:
@@ -697,3 +478,5 @@ class QDense(nn.Module):
         out = out.view(x.size(0), -1)
         
         return out
+    
+    
