@@ -371,157 +371,226 @@ def count_parameters(model):
     """Count trainable parameters in the model"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-class BottleneckBlock(nn.Module):
-    def __init__(self, in_planes, out_planes, dropRate=0.0):
-        super(BottleneckBlock, self).__init__()
-        inter_planes = out_planes * 4
-        self.bn1 = IQBN(in_planes)
-        self.relu = QSiLU()
-        self.conv1 = QConv2D(in_planes, inter_planes, kernel_size=1, stride=1,
-                           padding=0, bias=False)
-        self.bn2 = IQBN(inter_planes)
-        self.conv2 = QConv2D(inter_planes, out_planes, kernel_size=3, stride=1,
-                           padding=1, bias=False)
-        self.droprate = dropRate
-    def forward(self, x):
-        out = self.conv1(self.relu(self.bn1(x)))
-        if self.droprate > 0:
-            out = QuaternionDropout(p=self.droprate)(out)
-        out = self.conv2(self.relu(self.bn2(out)))
-        if self.droprate > 0:
-            out = QuaternionDropout(p=self.droprate)(out)
-        return torch.cat([x, out], 1)
-
-
 class QuaternionBasicBlock(nn.Module):
-    """Enhanced residual block for quaternion networks"""
-    def __init__(self, in_channels, out_channels, stride=1, dropout_rate=0.0):
-        super(QuaternionBasicBlock, self).__init__()
+    """Basic block with pre-activation but no SE or dropout"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
         
         # First convolution block
+        self.bn1 = IQBN(in_channels)
+        self.relu1 = QSiLU()
         self.conv1 = QConv2D(in_channels, out_channels, kernel_size=3, 
                             stride=stride, padding=1)
-        self.bn1 = IQBN(in_channels)
-        self.relu = QSiLU()
-
-        self.dropout1 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
-
+        
         # Second convolution block
+        self.bn2 = IQBN(out_channels)
+        self.relu2 = QSiLU()
         self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3,
                             stride=1, padding=1)
-        self.bn2 = IQBN(out_channels)
-
-        self.dropout2 = QuaternionDropout(p=dropout_rate) if dropout_rate > 0 else nn.Identity()
-
-        # Add batch normalization after shortcut for better regularization
+        
+        # Shortcut connection
         self.shortcut = nn.Identity()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = QConv2D(in_channels, out_channels, kernel_size=1,
-                                stride=stride)
+                                  stride=stride)
+    
     def forward(self, x):
         identity = self.shortcut(x)
         
-
-        # First block
+        # First block with pre-activation
         out = self.bn1(x)
-        out = self.relu(out)
+        out = self.relu1(out)
         out = self.conv1(out)
-        # out = self.bn1(out)
+        
         # Second block
         out = self.bn2(out)
-        out = self.relu(out)
+        out = self.relu2(out)
         out = self.conv2(out)
-        # out = self.bn2(out)      
+        
+        # Add residual
         out += identity
+        
+        return out
+
+class QShallowResNet(nn.Module):
+    def __init__(self, num_classes=10, mapping_type='poincare'):
+        super().__init__()
+        
+        # Initial layer to learn quaternion components from RGB
+        self.conv1 = nn.Sequential(
+            QConv2D(3, 16, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
+            IQBN(16),
+            QSiLU()
+        )
+        
+        # Stage 1: 2 residual blocks (16 quaternion filters)
+        self.stage1 = self._make_stage(16, 16, blocks=2, stride=1, mapping_type=mapping_type)
+        
+        # Stage 2: 1 residual block (32 quaternion filters)
+        self.stage2 = self._make_stage(16, 32, blocks=1, stride=2, mapping_type=mapping_type)
+        
+        # Stage 3: 1 residual block (64 quaternion filters)
+        self.stage3 = self._make_stage(32, 64, blocks=1, stride=2, mapping_type=mapping_type)
+        
+        # Global Average Pooling
+        self.avg_pool = QuaternionAvgPool()
+        
+        # Classifier - simple fully connected layer as in paper
+        self.fc = QDense(64, num_classes * 4, mapping_type=mapping_type)
+    
+    def _make_stage(self, in_channels, out_channels, blocks, stride, mapping_type):
+        layers = []
+        
+        # First block may have stride for downsampling
+        layers.append(QuaternionBasicBlock(in_channels, out_channels, stride, mapping_type))
+        
+        # Remaining blocks have stride=1
+        for _ in range(1, blocks):
+            layers.append(QuaternionBasicBlock(out_channels, out_channels, 1, mapping_type))
+        
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        # Initial conv
+        x = self.conv1(x)
+        
+        # Residual stages
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        
+        # Global average pooling
+        x = self.avg_pool(x)
+        
+        # Reshape for classifier
+        x = x.view(x.size(0), -1)
+        
+        # Classification layer
+        x = self.fc(x)
+        
+        # Extract only real component for final classification
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1, 4)
+        real_components = x[:, :, 0]
+        
+        return real_components
+
+
+class QuaternionBottleneckBlock(nn.Module):
+    """Bottleneck block with pre-activation but no SE or dropout"""
+    def __init__(self, in_channels, out_channels, stride=1):
+        super().__init__()
+        bottleneck_channels = out_channels // 2
+        
+        # Pre-activation for the first block
+        self.bn1 = IQBN(in_channels)
+        self.relu1 = QSiLU()
+        # 1x1 projection
+        self.conv1 = QConv2D(in_channels, bottleneck_channels, kernel_size=1, stride=1)
+        
+        # 3x3 convolution
+        self.bn2 = IQBN(bottleneck_channels)
+        self.relu2 = QSiLU()
+        self.conv2 = QConv2D(bottleneck_channels, bottleneck_channels, kernel_size=3, 
+                           stride=stride, padding=1)
+        
+        # 1x1 expansion
+        self.bn3 = IQBN(bottleneck_channels)
+        self.relu3 = QSiLU()
+        self.conv3 = QConv2D(bottleneck_channels, out_channels, kernel_size=1)
+        
+        # Skip connection
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                QConv2D(in_channels, out_channels, kernel_size=1, stride=stride),
+                IQBN(out_channels)
+            )
+    
+    def forward(self, x):
+        identity = self.shortcut(x)
+        
+        # First 1x1 projection with pre-activation
+        out = self.bn1(x)
+        out = self.relu1(out)
+        out = self.conv1(out)
+        
+        # 3x3 processing
+        out = self.bn2(out)
+        out = self.relu2(out)
+        out = self.conv2(out)
+        
+        # 1x1 expansion
+        out = self.bn3(out)
+        out = self.relu3(out)
+        out = self.conv3(out)
+        
+        # Add identity
+        out += identity
+        
         return out
 
 class QResNet34(nn.Module):
     """
-    Quaternion ResNet34 implementation exactly matching the paper's architecture
+    QResNet34 with mixed block types and increased width,
+    without SE attention or dropout
     """
-    def __init__(self, num_classes=10, mapping_type='raw_normalized'):
+    def __init__(self, num_classes=10, mapping_type='poincare', width_multiplier=2):
         super().__init__()
         
-        self.dropout_rates = {
-            'initial': [.1, .15, .2, .2, .25],  # [block2, block3, block4, block5, classifier]
-            'increment': 0.05  # Amount to increase after each LR drop
-        }
-        self.current_rates = self.dropout_rates['initial'].copy()
+        # Increase channel width throughout the network
+        base_width = int(64 * width_multiplier)
         
-        # Conv1: [3 × 32 × 32 × 16] output
+        # Initial convolution with increased width
         self.conv1 = nn.Sequential(
-            QConv2D(3, 64, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
-            IQBN(64),
+            QConv2D(3, base_width, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
+            IQBN(base_width),
             QSiLU()
         )
         
-        self.conv2_x = self._make_layer(64, 64, 3, 1, mapping_type, dropout_idx=0)
-        self.conv3_x = self._make_layer(64, 128, 4, 2, mapping_type, dropout_idx=1)
-        self.conv4_x = self._make_layer(128, 256, 6, 2, mapping_type, dropout_idx=2)
-        self.conv5_x = self._make_layer(256, 256, 3, 2, mapping_type, dropout_idx=3)
+        # Early layers use basic blocks for faster processing
+        self.conv2_x = self._make_basic_layer(base_width, base_width, 3, 1)
+        self.conv3_x = self._make_basic_layer(base_width, base_width*2, 4, 2)
         
-        # Global Average Pooling: [3 × 128] output
+        # Deeper layers use bottleneck blocks for parameter efficiency
+        self.conv4_x = self._make_bottleneck_layer(base_width*2, base_width*4, 6, 2)
+        self.conv5_x = self._make_bottleneck_layer(base_width*4, base_width*8, 3, 2)
+        
+        # Global Average Pooling
         self.gap = QuaternionAvgPool()
         
-        if num_classes == 100:
+        # Enhanced classifier for CIFAR-10
+        if num_classes == 10:
             self.classifier = nn.Sequential(
                 nn.Flatten(),
-                QDense(256, 512, mapping_type=mapping_type),
+                QDense(base_width*8, 1024, mapping_type=mapping_type),
                 nn.SiLU(),
-                nn.Dropout(p=0.4),  # Increase dropout for regularization
-                QDense(512, 1024, mapping_type=mapping_type),
+                QDense(1024, 512, mapping_type=mapping_type),
                 nn.SiLU(),
-                nn.Dropout(p=0.4),
-                QDense(1024, num_classes * 4, mapping_type=mapping_type)
+                QDense(512, num_classes * 4, mapping_type=mapping_type)
             )
+        # Enhanced classifier for CIFAR-100
         else:
             self.classifier = nn.Sequential(
                 nn.Flatten(),
-                QDense(256, 512),             # First hidden layer
-                nn.BatchNorm1d(512),
-                nn.SiLU(),                    # Activation function
-                nn.Dropout(p=0.3),              # Regularization
-                QDense(512, 512),             # Second hidden layer
-                nn.SiLU(),                    # Activation function
-                nn.BatchNorm1d(512),
-                nn.Dropout(p=0.2),              # Regularization
-                QDense(512, num_classes * 4)  # Final classification layer
+                QDense(base_width*8, 2048, mapping_type=mapping_type),
+                nn.SiLU(),
+                QDense(2048, 2048, mapping_type=mapping_type),
+                nn.SiLU(),
+                QDense(2048, 1024, mapping_type=mapping_type),
+                nn.SiLU(),
+                QDense(1024, num_classes * 4, mapping_type=mapping_type)
             )
-
-
-    def update_dropout_rates(self):
-        """Increase dropout rates by the increment amount"""
-        for i in range(len(self.current_rates)):
-            self.current_rates[i] = min(0.5, self.current_rates[i] + self.dropout_rates['increment'])
-            
-        # Update dropout in all blocks
-        self._update_block_dropout(self.conv2_x, 0)
-        self._update_block_dropout(self.conv3_x, 1)
-        self._update_block_dropout(self.conv4_x, 2)
-        self._update_block_dropout(self.conv5_x, 3)
-        
-        # Update classifier dropout
-        if isinstance(self.classifier[3], nn.Dropout):
-            self.classifier[3].p = self.current_rates[4]
-
-    def _update_block_dropout(self, block, rate_idx):
-        """Update dropout rates in a block"""
-        for layer in block:
-            if isinstance(layer, QuaternionBasicBlock):
-                layer.dropout1.p = self.current_rates[rate_idx]
-                layer.dropout2.p = self.current_rates[rate_idx]
-
-
-    def _make_layer(self, in_channels, out_channels, num_blocks, stride, mapping_type, dropout_idx):
-        """Create a layer of residual blocks with dynamic dropout rates"""
+    
+    def _make_basic_layer(self, in_channels, out_channels, num_blocks, stride):
+        """Create a layer of basic blocks"""
         layers = []
         
         # First block handles stride and channel changes
         layers.append(QuaternionBasicBlock(
             in_channels=in_channels,
             out_channels=out_channels,
-            stride=stride,
-            dropout_rate=self.current_rates[dropout_idx]  # Use current_rates with index
+            stride=stride
         ))
         
         # Remaining blocks
@@ -529,167 +598,55 @@ class QResNet34(nn.Module):
             layers.append(QuaternionBasicBlock(
                 in_channels=out_channels,
                 out_channels=out_channels,
-                stride=1,
-                dropout_rate=self.current_rates[dropout_idx]  # Same dropout rate for all blocks in layer
+                stride=1
             ))
         
         return nn.Sequential(*layers)
+    
+    def _make_bottleneck_layer(self, in_channels, out_channels, num_blocks, stride):
+        """Create a layer of bottleneck blocks"""
+        layers = []
         
-
+        # First block handles stride and channel changes
+        layers.append(QuaternionBottleneckBlock(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=stride
+        ))
+        
+        # Remaining blocks
+        for _ in range(1, num_blocks):
+            layers.append(QuaternionBottleneckBlock(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                stride=1
+            ))
+        
+        return nn.Sequential(*layers)
+    
     def forward(self, x):
         # Initial conv
         x = self.conv1(x)
+        
         # Residual blocks
-        x = self.conv2_x(x)  # [3 × 32 × 32 × 16]
-        x = self.conv3_x(x)  # [3 × 16 × 16 × 32]
-        x = self.conv4_x(x)  # [3 × 8 × 8 × 64]
-        x = self.conv5_x(x)  # [3 × 4 × 4 × 128]
+        x = self.conv2_x(x)
+        x = self.conv3_x(x)
+        x = self.conv4_x(x)
+        x = self.conv5_x(x)
         
         # Global average pooling
-        x = self.gap(x)  # [3 × 128]
-
+        x = self.gap(x)
         
-        # Dropout
+        # Classification
         x = self.classifier(x)
-
+        
         batch_size = x.size(0)
-        x = x.view(batch_size, NUM_CLASSES, 4)  # Reshape to separate quaternion components
-        real_components = x[:, :, 0]  # Take only real part [batch_size, NUM_CLASSES]
-        
-        return real_components
+        x = x.view(batch_size, -1, 4)  # Reshape to separate quaternion components
+        # real_components = x[:, :, 0]  # Take only real part
+        quaternion_norm = torch.norm(x, dim=2)
 
-class QuaternionBasicBlock_NoDrop(nn.Module):
-    """Quaternion residual block without dropout"""
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(QuaternionBasicBlock_NoDrop, self).__init__()
-        
-        # First convolution block
-        self.conv1 = QConv2D(in_channels, out_channels, kernel_size=3, 
-                            stride=stride, padding=1)
-        self.bn1 = IQBN(out_channels)
-        self.relu = QSiLU()
+        return quaternion_norm
 
-        # Second convolution block
-        self.conv2 = QConv2D(out_channels, out_channels, kernel_size=3,
-                            stride=1, padding=1)
-        self.bn2 = IQBN(out_channels)
-
-        # Add batch normalization after shortcut for better regularization
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = QConv2D(in_channels, out_channels, kernel_size=1,
-                                stride=stride)
-    
-    def forward(self, x):
-        identity = self.shortcut(x)
-        
-        # First block
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-        
-        # Second block
-        out = self.conv2(out)
-        out = self.relu(out)
-        out = self.bn2(out)
-        
-        out += identity
-        return out
-
-# class QResNet34(nn.Module):
-#     def __init__(self, num_classes=10, mapping_type='raw_normalized'):
-#         super().__init__()
-        
-#         # Keep the existing convolutional backbone without dropout
-#         self.conv1 = nn.Sequential(
-#             QConv2D(3, 64, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
-#             IQBN(64),
-#             QSiLU()
-#         )
-        
-#         # Remove dropout from these blocks
-#         self.conv2_x = self._make_layer_without_dropout(64, 64, 3, 1, mapping_type)
-#         self.conv3_x = self._make_layer_without_dropout(64, 128, 4, 2, mapping_type)
-#         self.conv4_x = self._make_layer_without_dropout(128, 256, 6, 2, mapping_type)
-#         self.conv5_x = self._make_layer_without_dropout(256, 256, 3, 2, mapping_type)
-        
-#         # Global Average Pooling
-#         self.gap = QuaternionAvgPool()
-        
-#         # Enhanced classifier head for CIFAR-10
-#         if num_classes == 10:
-#             self.classifier = nn.Sequential(
-#                 nn.Flatten(),
-#                 # First dense block with BN
-#                 QDense(256, 512, mapping_type=mapping_type),
-#                 nn.BatchNorm1d(512*4),  # Apply BN after quaternion dense
-#                 nn.SiLU(),
-#                 nn.Dropout(0.2),  # Traditional dropout with lower rate
-                
-#                 # Second dense block
-#                 QDense(512, 512, mapping_type=mapping_type),
-#                 nn.BatchNorm1d(512*4),
-#                 nn.SiLU(),
-#                 nn.Dropout(0.2),
-                
-#                 # Output layer
-#                 QDense(512, num_classes * 4, mapping_type=mapping_type)
-#             )
-#         else:
-#             # Keep the existing CIFAR-100 classifier with dropout
-#             self.classifier = nn.Sequential(
-#                 nn.Flatten(),
-#                 QDense(256, 512, mapping_type=mapping_type),
-#                 nn.SiLU(),
-#                 nn.Dropout(p=0.4),  # Increase dropout for regularization
-#                 QDense(512, 1024, mapping_type=mapping_type),
-#                 nn.SiLU(),
-#                 nn.Dropout(p=0.4),
-#                 QDense(1024, num_classes * 4, mapping_type=mapping_type)
-#             )
-            
-    
-#     def _make_layer_without_dropout(self, in_channels, out_channels, num_blocks, stride, mapping_type):
-#         """Create a layer of residual blocks without dropout"""
-#         layers = []
-        
-#         # First block handles stride and channel changes
-#         layers.append(QuaternionBasicBlock_NoDrop(
-#             in_channels=in_channels,
-#             out_channels=out_channels,
-#             stride=stride
-#         ))
-        
-#         # Remaining blocks
-#         for _ in range(1, num_blocks):
-#             layers.append(QuaternionBasicBlock_NoDrop(
-#                 in_channels=out_channels,
-#                 out_channels=out_channels,
-#                 stride=1
-#             ))
-        
-#         return nn.Sequential(*layers)
-#     def forward(self, x):
-#         # Initial conv
-#         x = self.conv1(x)
-#         # Residual blocks
-#         x = self.conv2_x(x)  # [3 × 32 × 32 × 16]
-#         x = self.conv3_x(x)  # [3 × 16 × 16 × 32]
-#         x = self.conv4_x(x)  # [3 × 8 × 8 × 64]
-#         x = self.conv5_x(x)  # [3 × 4 × 4 × 128]
-        
-#         # Global average pooling
-#         x = self.gap(x)  # [3 × 128]
-
-        
-#         # Dropout
-#         x = self.classifier(x)
-
-#         batch_size = x.size(0)
-#         x = x.view(batch_size, NUM_CLASSES, 4)  # Reshape to separate quaternion components
-#         real_components = x[:, :, 0]  # Take only real part [batch_size, NUM_CLASSES]
-        
-#         return real_components
 
 class Cutout:
     """Randomly mask out a square patch from an image.
@@ -860,12 +817,24 @@ def visualize_feature_maps_to_disk(model, val_batch, epoch, output_dir):
 
 class MultiAugmentDataset(torch.utils.data.Dataset):
     """Dataset wrapper that applies multiple augmentations to each image"""
-    def __init__(self, dataset, augmentations_per_image=3, train=True):
+    def __init__(self, dataset, augmentations_per_image=3, train=True, dataset_type='cifar10'):
         self.dataset = dataset
         self.augmentations_per_image = augmentations_per_image
         self.train = train
         
-        # Import AutoAugment for CIFAR10
+        # Set the correct normalization values based on dataset
+        if dataset_type.lower() == 'cifar10':
+            # CIFAR-10 normalization values
+            self.mean = (0.4914, 0.4822, 0.4465)
+            self.std = (0.2023, 0.1994, 0.2010)
+        elif dataset_type.lower() == 'cifar100':
+            # CIFAR-100 normalization values
+            self.mean = (0.5071, 0.4867, 0.4408)
+            self.std = (0.2675, 0.2565, 0.2761)
+        else:
+            raise ValueError(f"Unknown dataset type: {dataset_type}")
+        
+        # Import AutoAugment for CIFAR
         from torchvision.transforms import AutoAugment, AutoAugmentPolicy
         
         # Strong augmentation with AutoAugment and Cutout
@@ -874,8 +843,7 @@ class MultiAugmentDataset(torch.utils.data.Dataset):
             transforms.RandomHorizontalFlip(),
             AutoAugment(AutoAugmentPolicy.CIFAR10),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
-                                (0.2675, 0.2565, 0.2761)),
+            transforms.Normalize(self.mean, self.std),  
             Cutout(n_holes=1, length=16)
         ])
         
@@ -884,15 +852,13 @@ class MultiAugmentDataset(torch.utils.data.Dataset):
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5071, 0.4867, 0.4408),
-                                (0.2675, 0.2565, 0.2761))
+            transforms.Normalize(self.mean, self.std)  
         ])
         
-        # Test transform
+        # Test transform - uses the same normalization as training
         self.test_transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), 
-                               (0.2023, 0.1994, 0.2010))
+            transforms.Normalize(self.mean, self.std)  
         ])
         
         # Pre-compute augmentation indices for efficiency
@@ -922,25 +888,36 @@ class MultiAugmentDataset(torch.utils.data.Dataset):
             return len(self.dataset) * self.augmentations_per_image
         return len(self.dataset)
 
-def get_data_loaders(batch_size=256, augmentations_per_image=1, num_workers=1):
+def get_data_loaders(batch_size=256, augmentations_per_image=1, num_workers=4, dataset_type='cifar10'):
     """Get train and test data loaders with multiple augmentations"""
     
-    # Load base CIFAR-10 dataset
-    trainset = torchvision.datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=None)
-    testset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=None)
+    # Choose the right dataset
+    if dataset_type.lower() == 'cifar10':
+        train_dataset = torchvision.datasets.CIFAR10(
+            root='./data', train=True, download=True, transform=None)
+        test_dataset = torchvision.datasets.CIFAR10(
+            root='./data', train=False, download=True, transform=None)
+    elif dataset_type.lower() == 'cifar100':
+        train_dataset = torchvision.datasets.CIFAR100(
+            root='./data', train=True, download=True, transform=None)
+        test_dataset = torchvision.datasets.CIFAR100(
+            root='./data', train=False, download=True, transform=None)
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
+
     
     # Wrap datasets with multi-augmentation
     train_dataset = MultiAugmentDataset(
-        trainset, 
+        train_dataset, 
         augmentations_per_image=augmentations_per_image,
-        train=True
+        train=True,
+        dataset_type=dataset_type
     )
     test_dataset = MultiAugmentDataset(
-        testset,
+        test_dataset,
         augmentations_per_image=1,  # No augmentation for test
-        train=False
+        train=False,
+        dataset_type=dataset_type
     )
     
     # Create data loaders
@@ -968,51 +945,51 @@ def get_data_loaders(batch_size=256, augmentations_per_image=1, num_workers=1):
     
     return train_loader, test_loader
 
-def train_epoch(model, train_loader, criterion, optimizer, epoch, device):
-    """
-    Train for one epoch with optimized GPU handling
-    """
-    model.train()
-    running_loss = 0.0
-    correct = 0
-    total = 0
+# def train_epoch(model, train_loader, criterion, optimizer, epoch, device):
+#     """
+#     Train for one epoch with optimized GPU handling
+#     """
+#     model.train()
+#     running_loss = 0.0
+#     correct = 0
+#     total = 0
     
-    train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
+#     train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
     
-    for batch_idx, (inputs, targets) in enumerate(train_pbar):
-        # Move data to GPU efficiently
-        inputs = inputs.cuda(device, non_blocking=True)
-        targets = targets.cuda(device, non_blocking=True)
+#     for batch_idx, (inputs, targets) in enumerate(train_pbar):
+#         # Move data to GPU efficiently
+#         inputs = inputs.cuda(device, non_blocking=True)
+#         targets = targets.cuda(device, non_blocking=True)
         
-        # Zero gradients
-        optimizer.zero_grad(set_to_none=True)  # More efficient than standard zero_grad()
+#         # Zero gradients
+#         optimizer.zero_grad(set_to_none=True)  # More efficient than standard zero_grad()
         
-        # Forward pass
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+#         # Forward pass
+#         outputs = model(inputs)
+#         loss = criterion(outputs, targets)
         
-        # Backward pass
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+#         # Backward pass
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#         optimizer.step()
         
-        # Update metrics
-        running_loss += loss.item()
-        _, predicted = outputs.max(1)
-        total += targets.size(0)
-        correct += predicted.eq(targets).sum().item()
+#         # Update metrics
+#         running_loss += loss.item()
+#         _, predicted = outputs.max(1)
+#         total += targets.size(0)
+#         correct += predicted.eq(targets).sum().item()
         
-        # Update progress bar
-        train_pbar.set_postfix({
-            'Loss': f'{running_loss/(batch_idx+1):.4f}',
-            'Acc': f'{100.*correct/total:.2f}%'
-        })
+#         # Update progress bar
+#         train_pbar.set_postfix({
+#             'Loss': f'{running_loss/(batch_idx+1):.4f}',
+#             'Acc': f'{100.*correct/total:.2f}%'
+#         })
         
-        # Clean up GPU memory
-        del outputs, loss
+#         # Clean up GPU memory
+#         del outputs, loss
         
-    train_pbar.close()
-    return running_loss / len(train_loader), 100. * correct / total
+#     train_pbar.close()
+#     return running_loss / len(train_loader), 100. * correct / total
 
 def evaluate(model, test_loader, criterion, device):
     """
@@ -1040,37 +1017,118 @@ def evaluate(model, test_loader, criterion, device):
     
     return test_loss / len(test_loader), 100. * correct / total
 
+
+
+def mixup_data(x, y, alpha=0.2):
+    """Applies mixup augmentation to the batch"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
+    else:
+        lam = 1
+
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    """Mixup loss function"""
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+def train_epoch(model, train_loader, criterion, optimizer, epoch, device):
+    """
+    Train for one epoch with optimized GPU handling and MixUp
+    """
+    model.train()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    train_pbar = tqdm.tqdm(train_loader, desc='Training', position=1, leave=False)
+    
+    for batch_idx, (inputs, targets) in enumerate(train_pbar):
+        # Move data to GPU efficiently
+        inputs = inputs.cuda(device, non_blocking=True)
+        targets = targets.cuda(device, non_blocking=True)
+        
+        # Apply MixUp augmentation
+        inputs, targets_a, targets_b, lam = mixup_data(inputs, targets, alpha=0.1)
+        
+        # Zero gradients
+        optimizer.zero_grad(set_to_none=True)  # More efficient than standard zero_grad()
+        
+        # Forward pass
+        outputs = model(inputs)
+        
+        # MixUp loss calculation
+        loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # Update metrics - use weighted accuracy for MixUp
+        running_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        
+        # Calculate accuracy for both target sets and weight by lambda
+        correct_a = predicted.eq(targets_a).sum().item()
+        correct_b = predicted.eq(targets_b).sum().item()
+        correct += lam * correct_a + (1 - lam) * correct_b
+        
+        # Update progress bar
+        train_pbar.set_postfix({
+            'Loss': f'{running_loss/(batch_idx+1):.4f}',
+            'Acc': f'{100.*correct/total:.2f}%'
+        })
+        
+        # Clean up GPU memory
+        del outputs, loss
+        
+    train_pbar.close()
+    return running_loss / len(train_loader), 100. * correct / total
+
 def main():
     if not os.path.exists(SAVE_DIR):
         os.makedirs(SAVE_DIR)
     
     # Constants for augmentation
-    NUM_AUGMENTATIONS = 3  # Number of augmentations per image
-    # RANDOM_SEED = 42
-    # set_random_seeds(RANDOM_SEED)
+    NUM_AUGMENTATIONS = 1  # Reduced from 3 to 2
+    
     # Initialize logging
-    writer = SummaryWriter('runs/quaternion_densenet')
+    writer = SummaryWriter('runs/quaternion_cifar100')
     metrics_logger = MetricsLogger(SAVE_DIR)
     
-    # Get dataloaders with augmentation
+    # Get dataloaders with 2 augmentations
     train_loader, test_loader = get_data_loaders(
         batch_size=BATCH_SIZE,
-        augmentations_per_image=1,
-        num_workers=1,
+        augmentations_per_image=NUM_AUGMENTATIONS,
+        num_workers=4,
+        dataset_type='cifar100'  # Specify CIFAR-100
     )
-    # model = ResNet34(num_classes=10)
-    model = QResNet34(num_classes=10, mapping_type='poincare')
+    
+    # Keep QResNet34 with bottleneck blocks
+    model = QResNet34(num_classes=100, mapping_type='poincare', width_multiplier=1.5)
+    
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(model.parameters(), 
-                            lr=0.1,
-                            momentum=0.9, 
-                            weight_decay=5e-4,
-                            nesterov=True)
+    # Add label smoothing to criterion
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     
+    optimizer = torch.optim.SGD(
+        model.parameters(), 
+        lr=0.1,                
+        momentum=0.9, 
+        weight_decay=5e-4,     
+        nesterov=True 
+    )
+
 
     l1_reg = L1Regularization(L1_REG)
     
@@ -1101,7 +1159,7 @@ def main():
         
         # Validation
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
-        visualize_feature_maps_to_disk(model, val_batch, epoch, SAVE_DIR)
+        # visualize_feature_maps_to_disk(model, val_batch, epoch, SAVE_DIR)
         # Step scheduler
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]

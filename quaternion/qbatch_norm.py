@@ -287,7 +287,7 @@ class IQBN(nn.Module):
         self.eps = eps
         self.momentum = momentum
         
-        # Parameters reshaped for correct broadcasting
+        # Parameters for correct broadcasting
         self.gamma = nn.Parameter(torch.ones(self.num_features, 4))
         self.beta = nn.Parameter(torch.zeros(self.num_features, 4))
         
@@ -310,7 +310,7 @@ class IQBN(nn.Module):
         # Batch statistics - process all spatial dimensions at once for efficiency
         x_flat = x.reshape(B, C, Q, -1)
         mean = x_flat.mean(dim=[0, 3], keepdim=True)  # [1, C, Q, 1]
-        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False)
+        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False) + 1e-8  # Added eps for stability
         
         # Update running stats
         with torch.no_grad():
