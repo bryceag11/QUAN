@@ -105,3 +105,148 @@ class QInit:
             return (weight_shape[2], weight_shape[3], weight_shape[4])
         else:
             raise ValueError(f"Unsupported number of dimensions: {dim}")
+        
+
+
+import torch
+import numpy as np
+from typing import Union, Tuple, List, Optional
+
+class QuaternionInit:
+    """
+    Quaternion weight initialization for PyTorch quaternion neural networks.
+    
+    This initializer creates quaternion-valued weights with modulus sampled from
+    a Chi distribution with 4 degrees of freedom and a random unit quaternion vector.
+    
+    Args:
+        kernel_size: Size of the convolutional kernel
+        in_features: Number of input features (divided by 4 for quaternion representation)
+        out_features: Number of output features (divided by 4 for quaternion representation)
+        criterion: Weight initialization criterion ('he' or 'glorot')
+        rng: Random number generator or seed
+    """
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, ...]],
+        in_features: int,
+        out_features: int,
+        criterion: str = 'he',
+        rng: Optional[Union[np.random.RandomState, int]] = None
+    ):
+        if isinstance(kernel_size, int):
+            self.kernel_size = (kernel_size,)
+        else:
+            self.kernel_size = kernel_size
+            
+        self.in_features = in_features
+        self.out_features = out_features
+        self.criterion = criterion
+        
+        if isinstance(rng, np.random.RandomState):
+            self.rng = rng
+        else:
+            self.rng = np.random.RandomState(rng or 1234)
+    
+    def initialize(self, shape=None, device=None):
+        """
+        Generate quaternion weights with proper initialization.
+        
+        Returns:
+            Tuple of (W_r, W_i, W_j, W_k) for the quaternion components
+        """
+        # Calculate kernel parameter for quaternion weight init
+        if self.criterion == 'glorot':
+            # Glorot/Xavier initialization
+            fan_in = self.in_features * np.prod(self.kernel_size)
+            fan_out = self.out_features * np.prod(self.kernel_size)
+            scale = 1.0 / np.sqrt(2.0 * (fan_in + fan_out))
+        elif self.criterion == 'he':
+            # He initialization (better for ReLU)
+            fan_in = self.in_features * np.prod(self.kernel_size)
+            scale = 1.0 / np.sqrt(2.0 * fan_in)
+        else:
+            raise ValueError(f"Unknown initialization criterion: {self.criterion}")
+        
+        # Get the final weight shape
+        if shape is None:
+            # Reshaped for PyTorch convolution: (out_channels, in_channels, *kernel_size)
+            out_shape = (self.out_features, self.in_features, *self.kernel_size)
+        else:
+            out_shape = shape
+        
+        # Calculate the number of weights
+        n_weight = np.prod(out_shape)
+        
+        # Sample modulus from Chi distribution with 4 degrees of freedom
+        modulus = self.chi_distribution(n_weight, scale)
+        
+        # Generate random unit quaternion components
+        # Create a random 3D unit vector
+        v1 = self.rng.normal(0, 1, n_weight)
+        v2 = self.rng.normal(0, 1, n_weight)
+        v3 = self.rng.normal(0, 1, n_weight)
+        
+        # Normalize to unit vector
+        norm = np.sqrt(v1**2 + v2**2 + v3**2) + 1e-8  # Avoid division by zero
+        v1, v2, v3 = v1 / norm, v2 / norm, v3 / norm
+        
+        # Random angle for rotation
+        theta = self.rng.uniform(-np.pi, np.pi, n_weight)
+        
+        # Construct quaternion components using quaternion rotation formula
+        # w = cos(theta/2)
+        # x,y,z = sin(theta/2) * unit_vector
+        half_theta = theta / 2.0
+        weight_r = np.cos(half_theta)
+        weight_i = np.sin(half_theta) * v1
+        weight_j = np.sin(half_theta) * v2
+        weight_k = np.sin(half_theta) * v3
+        
+        # Apply modulus to get the final weights
+        weight_r = modulus * weight_r
+        weight_i = modulus * weight_i
+        weight_j = modulus * weight_j
+        weight_k = modulus * weight_k
+        
+        # Reshape to the desired output shape
+        weight_r = weight_r.reshape(out_shape)
+        weight_i = weight_i.reshape(out_shape)
+        weight_j = weight_j.reshape(out_shape)
+        weight_k = weight_k.reshape(out_shape)
+        
+        # Convert to PyTorch tensors and move to device if specified
+        weight_r = torch.FloatTensor(weight_r)
+        weight_i = torch.FloatTensor(weight_i)
+        weight_j = torch.FloatTensor(weight_j)
+        weight_k = torch.FloatTensor(weight_k)
+        
+        if device is not None:
+            weight_r = weight_r.to(device)
+            weight_i = weight_i.to(device)
+            weight_j = weight_j.to(device)
+            weight_k = weight_k.to(device)
+            
+        return weight_r, weight_i, weight_j, weight_k
+    
+    def chi_distribution(self, size, scale):
+        """
+        Generate samples from a Chi distribution with 4 degrees of freedom.
+        
+        This is used for the modulus of quaternion weights.
+        
+        Args:
+            size: Number of samples to generate
+            scale: Scaling factor for the distribution
+            
+        Returns:
+            Numpy array of Chi-distributed random values
+        """
+        # Chi distribution with 4 DOF can be generated from normal distributions
+        x1 = self.rng.normal(0, scale, size)
+        x2 = self.rng.normal(0, scale, size)
+        x3 = self.rng.normal(0, scale, size)
+        x4 = self.rng.normal(0, scale, size)
+        
+        # The modulus is the Euclidean norm of these 4 normal variables
+        return np.sqrt(x1**2 + x2**2 + x3**2 + x4**2)       

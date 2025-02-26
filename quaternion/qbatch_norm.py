@@ -296,41 +296,32 @@ class IQBN(nn.Module):
         self.register_buffer('running_var', torch.ones(self.num_features, 4))
 
     def forward(self, x):
-        # Quick validation
-        if x.size(2) != 4:
-            raise ValueError("Expected quaternion input with 4 components")
-            
+        # Quick shape check
         B, C, Q, H, W = x.shape
-            
+        
         if not self.training:
-            # Eval mode - use running stats
+            # Faster evaluation using pre-computed stats
             mean = self.running_mean.view(1, self.num_features, 4, 1, 1)
             var = self.running_var.view(1, self.num_features, 4, 1, 1)
-            x_norm = (x - mean) / (var + self.eps).sqrt()
+            x_norm = (x - mean) / torch.sqrt(var + self.eps)
             return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-            
-        # Training mode
-        # Reshape for efficient stat computation while preserving quaternion structure
-        x_reshaped = x.permute(0, 3, 4, 1, 2).reshape(-1, self.num_features, 4)
         
-        # Compute batch statistics
-        mean = x_reshaped.mean(dim=0)  # [C, 4]
-        var = x_reshaped.var(dim=0, unbiased=False)  # [C, 4]
+        # Training mode optimized
+        # Batch statistics - process all spatial dimensions at once for efficiency
+        x_flat = x.reshape(B, C, Q, -1)
+        mean = x_flat.mean(dim=[0, 3], keepdim=True)  # [1, C, Q, 1]
+        var = x_flat.var(dim=[0, 3], keepdim=True, unbiased=False)
         
         # Update running stats
         with torch.no_grad():
-            self.running_mean = self.running_mean * (1 - self.momentum) + mean * self.momentum
-            self.running_var = self.running_var * (1 - self.momentum) + var * self.momentum
+            self.running_mean = (1 - self.momentum) * self.running_mean + self.momentum * mean.squeeze()
+            self.running_var = (1 - self.momentum) * self.running_var + self.momentum * var.squeeze()
         
         # Normalize
-        mean = mean.view(1, self.num_features, 4, 1, 1)
-        var = var.view(1, self.num_features, 4, 1, 1)
-        x_norm = (x - mean) / (var + self.eps).sqrt()
+        x_norm = (x - mean.view(1, C, Q, 1, 1)) / torch.sqrt(var.view(1, C, Q, 1, 1) + self.eps)
         
-        # Apply learnable parameters
+        # Apply affine parameters
         return x_norm * self.gamma.view(1, self.num_features, 4, 1, 1) + self.beta.view(1, self.num_features, 4, 1, 1)
-
-
 #     """
 #     Quaternion Batch Normalization with careful running stats management
 #     """

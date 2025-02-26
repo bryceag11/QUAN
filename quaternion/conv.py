@@ -189,7 +189,7 @@ class QConv(nn.Module):
         scale_factors = {
             'luminance': [1.0, 1.0, 1.0, 1.0],      # Emphasize real component
             'mean_brightness': [1.0, 0.75, 0.75, 0.75],  # Slightly more balanced
-            'raw_normalized': [1.0, 0.5, 0.5, 0.5],  # Equal emphasis
+            'raw_normalized': [1.0, 1.0, 1.0, 1.0],  # Equal emphasis
             'poincare': [1.0, 1.0, 1.0, 1.0]  # Equal emphasis
 
         }
@@ -207,39 +207,54 @@ class QConv(nn.Module):
                 bound = 1 / math.sqrt(fan_in) * scales[i]  # Scale bias bound by component weight
                 nn.init.uniform_(conv.bias, -bound, bound)
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-            if x.size(1) == 3:  # RGB input
-                with torch.no_grad():
-                    x = self.rgb_to_quaternion(x)
+        # Handle RGB input
+        if x.size(1) == 3:  # RGB input
+            x = self.rgb_to_quaternion(x)
             
-            if self.is_first_layer:
-                B, Q, H, W = x.shape
-                assert Q == 4, "First layer input must have 4 quaternion components"
-                r_conv = self.conv_r(x[:, 0:1])
-                i_conv = self.conv_i(x[:, 1:2])
-                j_conv = self.conv_j(x[:, 2:3])
-                k_conv = self.conv_k(x[:, 3:4])
-            else:
-                x_r = x[:, :, 0, :, :]
-                x_i = x[:, :, 1, :, :]
-                x_j = x[:, :, 2, :, :]
-                x_k = x[:, :, 3, :, :]
-                r_conv = self.conv_r(x_r)
-                i_conv = self.conv_i(x_i)
-                j_conv = self.conv_j(x_j)
-                k_conv = self.conv_k(x_k)
+        if self.is_first_layer:
+            # Process first layer more efficiently
+            B, Q, H, W = x.shape
+            # Stack components for single batch processing
+            x_stacked = x.reshape(B*Q, 1, H, W)
+            r_conv = self.conv_r(x_stacked.view(B, Q, H, W)[:, 0:1])
+            i_conv = self.conv_i(x_stacked.view(B, Q, H, W)[:, 1:2])
+            j_conv = self.conv_j(x_stacked.view(B, Q, H, W)[:, 2:3])
+            k_conv = self.conv_k(x_stacked.view(B, Q, H, W)[:, 3:4])
+        else:
+            # For subsequent layers, use channel-wise processing
+            x_r = x[:, :, 0, :, :]
+            x_i = x[:, :, 1, :, :]
+            x_j = x[:, :, 2, :, :]
+            x_k = x[:, :, 3, :, :]
             
-            # Compute outputs without cloning
-            out_r = r_conv - i_conv - j_conv - k_conv
-            out_i = r_conv + i_conv + j_conv - k_conv
-            out_j = r_conv - i_conv + j_conv + k_conv
-            out_k = r_conv + i_conv - j_conv + k_conv
-            
-            out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
-            del r_conv, i_conv, j_conv, k_conv
-            return out
-    
+            # Process in parallel if possible
+            r_conv = self.conv_r(x_r)
+            i_conv = self.conv_i(x_i)
+            j_conv = self.conv_j(x_j)
+            k_conv = self.conv_k(x_k)
+        
+        # Use in-place operations and fuse calculations where possible
+        out_r = r_conv
+        out_r.sub_(i_conv).sub_(j_conv).sub_(k_conv)
+        
+        out_i = r_conv.clone()
+        out_i.add_(i_conv).add_(j_conv).sub_(k_conv)
+        
+        out_j = r_conv.clone()
+        out_j.sub_(i_conv).add_(j_conv).add_(k_conv)
+        
+        out_k = r_conv.clone()
+        out_k.add_(i_conv).sub_(j_conv).add_(k_conv)
+        
+        # Stack outputs efficiently
+        out = torch.stack([out_r, out_i, out_j, out_k], dim=2)
+        
+        # Clean up intermediate tensors to save memory
+        del r_conv, i_conv, j_conv, k_conv
+        
+        return out
+
     def rgb_to_quaternion(self, rgb_input):
         B, C, H, W = rgb_input.shape
         luminance = (0.299 * rgb_input[:, 0] + 0.587 * rgb_input[:, 1] + 0.114 * rgb_input[:, 2]).unsqueeze(1).to(rgb_input.device)
