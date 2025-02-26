@@ -367,6 +367,7 @@ class ResNet34(nn.Module):
         x = self.fc(x)
         
         return x
+
 def count_parameters(model):
     """Count trainable parameters in the model"""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -418,35 +419,36 @@ class QShallowResNet(nn.Module):
         
         # Initial layer to learn quaternion components from RGB
         self.conv1 = nn.Sequential(
-            QConv2D(3, 16, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
-            IQBN(16),
+            QConv2D(3, 64, kernel_size=3, stride=1, padding=1),
+            IQBN(64),
             QSiLU()
         )
         
         # Stage 1: 2 residual blocks (16 quaternion filters)
-        self.stage1 = self._make_stage(16, 16, blocks=2, stride=1, mapping_type=mapping_type)
+        self.stage1 = self._make_stage(64, 64, blocks=2, stride=1)
         
         # Stage 2: 1 residual block (32 quaternion filters)
-        self.stage2 = self._make_stage(16, 32, blocks=1, stride=2, mapping_type=mapping_type)
+        self.stage2 = self._make_stage(64, 128, blocks=1, stride=2)
         
         # Stage 3: 1 residual block (64 quaternion filters)
-        self.stage3 = self._make_stage(32, 64, blocks=1, stride=2, mapping_type=mapping_type)
+        self.stage3 = self._make_stage(128, 256, blocks=1, stride=2)
         
         # Global Average Pooling
         self.avg_pool = QuaternionAvgPool()
-        
-        # Classifier - simple fully connected layer as in paper
-        self.fc = QDense(64, num_classes * 4, mapping_type=mapping_type)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            QDense(256, num_classes * 4, mapping_type=mapping_type)
+        )
     
-    def _make_stage(self, in_channels, out_channels, blocks, stride, mapping_type):
+    def _make_stage(self, in_channels, out_channels, blocks, stride):
         layers = []
         
         # First block may have stride for downsampling
-        layers.append(QuaternionBasicBlock(in_channels, out_channels, stride, mapping_type))
+        layers.append(QuaternionBasicBlock(in_channels, out_channels, stride))
         
         # Remaining blocks have stride=1
         for _ in range(1, blocks):
-            layers.append(QuaternionBasicBlock(out_channels, out_channels, 1, mapping_type))
+            layers.append(QuaternionBasicBlock(out_channels, out_channels, 1))
         
         return nn.Sequential(*layers)
     
@@ -462,18 +464,133 @@ class QShallowResNet(nn.Module):
         # Global average pooling
         x = self.avg_pool(x)
         
-        # Reshape for classifier
-        x = x.view(x.size(0), -1)
-        
-        # Classification layer
-        x = self.fc(x)
+        x = self.classifier(x)
         
         # Extract only real component for final classification
         batch_size = x.size(0)
         x = x.view(batch_size, -1, 4)
-        real_components = x[:, :, 0]
+        quaternion_norm = torch.norm(x, dim=2)
+
+        return quaternion_norm
+
+
+class QResNet110(nn.Module):
+    """
+    ResNet110 with quaternion operations
+    - 3 stages with 18 blocks each (total 110 layers)
+    - Narrow base width (16 channels)
+    - Separate heads for CIFAR-10 and CIFAR-100
+    """
+    def __init__(self, num_classes=10, mapping_type='poincare', width_multiplier=1.0):
+        super().__init__()
         
-        return real_components
+        # Base width - use multiplier to adjust model capacity
+        # For true ResNet110, width_multiplier=1.0 is appropriate
+        base_width = max(int(16 * width_multiplier), 8)  # Minimum 8 channels
+        
+        # Initial convolution
+        self.conv1 = nn.Sequential(
+            QConv2D(3, base_width, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
+            IQBN(base_width),
+            QSiLU()
+        )
+        
+        # 3 stages with 18 blocks each (36 convs per stage)
+        # Stage 1: No downsampling (retain spatial dimensions)
+        self.stage1 = self._make_layer(base_width, base_width, blocks=18, stride=1, mapping_type=mapping_type)
+        
+        # Stage 2: Downsample by 2
+        self.stage2 = self._make_layer(base_width, base_width*2, blocks=18, stride=2, mapping_type=mapping_type)
+        
+        # Stage 3: Downsample by 2 again
+        self.stage3 = self._make_layer(base_width*2, base_width*4, blocks=18, stride=2, mapping_type=mapping_type)
+        
+        # Global Average Pooling
+        self.avg_pool = QuaternionAvgPool()
+        
+        # Choose classifier based on dataset
+        if num_classes == 10:  # CIFAR-10
+            self.classifier = self._make_cifar10_head(base_width*4, mapping_type)
+        else:  # CIFAR-100
+            self.classifier = self._make_cifar100_head(base_width*4, mapping_type)
+            
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _make_layer(self, in_channels, out_channels, blocks, stride, mapping_type):
+        """Create a stage with specified number of residual blocks"""
+        layers = []
+        
+        # First block may have stride for downsampling
+        layers.append(QuaternionBasicBlock(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=stride
+        ))
+        
+        # Remaining blocks have stride=1 (no downsampling)
+        for _ in range(1, blocks):
+            layers.append(QuaternionBasicBlock(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                stride=1
+            ))
+        
+        return nn.Sequential(*layers)
+    
+    def _make_cifar10_head(self, in_features, mapping_type):
+        """Create a compact classifier head for CIFAR-10"""
+        return nn.Sequential(
+            nn.Flatten(),
+            QDense(in_features, 512, mapping_type=mapping_type),
+            nn.SiLU(),
+            QDense(512, 10 * 4, mapping_type=mapping_type)  # *4 for quaternion components
+        )
+    
+    def _make_cifar100_head(self, in_features, mapping_type):
+        """Create a classifier head for CIFAR-100 with more capacity"""
+        return nn.Sequential(
+            nn.Flatten(),
+            QDense(in_features, 1024, mapping_type=mapping_type),
+            nn.SiLU(),
+            QDense(1024, 512, mapping_type=mapping_type),
+            nn.SiLU(),
+            QDense(512, 100 * 4, mapping_type=mapping_type)  # *4 for quaternion components
+        )
+    
+    def _initialize_weights(self):
+        """Optional custom weight initialization"""
+        for m in self.modules():
+            if isinstance(m, QConv2D) or isinstance(m, QDense):
+                # Weight initialization is already handled in these layers
+                pass
+            elif isinstance(m, IQBN):
+                # Optional additional initialization for batch norm
+                pass
+    
+    def forward(self, x):
+        # Initial convolution
+        x = self.conv1(x)
+        
+        # Residual stages
+        x = self.stage1(x)  # 32×32
+        x = self.stage2(x)  # 16×16
+        x = self.stage3(x)  # 8×8
+        
+        # Global average pooling
+        x = self.avg_pool(x)  # 1×1
+        
+        # Classification
+        x = self.classifier(x)
+        
+        # Use quaternion norm for classification
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1, 4)  # Reshape to separate quaternion components
+        quaternion_norm = torch.norm(x, dim=2)  # Calculate magnitude of each quaternion
+        
+        return quaternion_norm
+
+
 
 
 class QuaternionBottleneckBlock(nn.Module):
@@ -535,55 +652,39 @@ class QResNet34(nn.Module):
     QResNet34 with mixed block types and increased width,
     without SE attention or dropout
     """
-    def __init__(self, num_classes=10, mapping_type='poincare', width_multiplier=2):
+    def __init__(self, num_classes=10, mapping_type='poincare'):
         super().__init__()
         
-        # Increase channel width throughout the network
-        base_width = int(64 * width_multiplier)
+        # Start with narrow base width (16 channels)
+        # This is critical for CIFAR models
+        base_width = 16
         
-        # Initial convolution with increased width
+        # Initial 3×3 convolution (no 7×7 and no maxpool for CIFAR)
         self.conv1 = nn.Sequential(
             QConv2D(3, base_width, kernel_size=3, stride=1, padding=1, mapping_type=mapping_type),
             IQBN(base_width),
             QSiLU()
         )
         
-        # Early layers use basic blocks for faster processing
-        self.conv2_x = self._make_basic_layer(base_width, base_width, 3, 1)
-        self.conv3_x = self._make_basic_layer(base_width, base_width*2, 4, 2)
-        
-        # Deeper layers use bottleneck blocks for parameter efficiency
-        self.conv4_x = self._make_bottleneck_layer(base_width*2, base_width*4, 6, 2)
-        self.conv5_x = self._make_bottleneck_layer(base_width*4, base_width*8, 3, 2)
+        # 3 stages with standard ResNet34 block counts [3, 4, 6]
+        # But channel counts follow CIFAR pattern [16, 32, 64]
+        self.stage1 = self._make_layer(base_width, base_width, blocks=3, stride=1)
+        self.stage2 = self._make_layer(base_width, base_width*2, blocks=4, stride=2)
+        self.stage3 = self._make_layer(base_width*2, base_width*4, blocks=6, stride=2)
         
         # Global Average Pooling
-        self.gap = QuaternionAvgPool()
+        self.avg_pool = QuaternionAvgPool()
         
-        # Enhanced classifier for CIFAR-10
-        if num_classes == 10:
-            self.classifier = nn.Sequential(
-                nn.Flatten(),
-                QDense(base_width*8, 1024, mapping_type=mapping_type),
-                nn.SiLU(),
-                QDense(1024, 512, mapping_type=mapping_type),
-                nn.SiLU(),
-                QDense(512, num_classes * 4, mapping_type=mapping_type)
-            )
-        # Enhanced classifier for CIFAR-100
-        else:
-            self.classifier = nn.Sequential(
-                nn.Flatten(),
-                QDense(base_width*8, 2048, mapping_type=mapping_type),
-                nn.SiLU(),
-                QDense(2048, 2048, mapping_type=mapping_type),
-                nn.SiLU(),
-                QDense(2048, 1024, mapping_type=mapping_type),
-                nn.SiLU(),
-                QDense(1024, num_classes * 4, mapping_type=mapping_type)
-            )
+        # Simple classifier for CIFAR-10
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            QDense(base_width*4, 256, mapping_type=mapping_type),
+            nn.SiLU(),
+            QDense(256, num_classes * 4, mapping_type=mapping_type)
+        )
     
-    def _make_basic_layer(self, in_channels, out_channels, num_blocks, stride):
-        """Create a layer of basic blocks"""
+    def _make_layer(self, in_channels, out_channels, blocks, stride):
+        """Create a layer of residual blocks"""
         layers = []
         
         # First block handles stride and channel changes
@@ -593,30 +694,9 @@ class QResNet34(nn.Module):
             stride=stride
         ))
         
-        # Remaining blocks
-        for _ in range(1, num_blocks):
+        # Remaining blocks with stride=1
+        for _ in range(1, blocks):
             layers.append(QuaternionBasicBlock(
-                in_channels=out_channels,
-                out_channels=out_channels,
-                stride=1
-            ))
-        
-        return nn.Sequential(*layers)
-    
-    def _make_bottleneck_layer(self, in_channels, out_channels, num_blocks, stride):
-        """Create a layer of bottleneck blocks"""
-        layers = []
-        
-        # First block handles stride and channel changes
-        layers.append(QuaternionBottleneckBlock(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            stride=stride
-        ))
-        
-        # Remaining blocks
-        for _ in range(1, num_blocks):
-            layers.append(QuaternionBottleneckBlock(
                 in_channels=out_channels,
                 out_channels=out_channels,
                 stride=1
@@ -628,23 +708,22 @@ class QResNet34(nn.Module):
         # Initial conv
         x = self.conv1(x)
         
-        # Residual blocks
-        x = self.conv2_x(x)
-        x = self.conv3_x(x)
-        x = self.conv4_x(x)
-        x = self.conv5_x(x)
+        # Residual stages
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
         
         # Global average pooling
-        x = self.gap(x)
+        x = self.avg_pool(x)
         
         # Classification
         x = self.classifier(x)
         
+        # Use quaternion norm for classification
         batch_size = x.size(0)
-        x = x.view(batch_size, -1, 4)  # Reshape to separate quaternion components
-        # real_components = x[:, :, 0]  # Take only real part
+        x = x.view(batch_size, -1, 4)
         quaternion_norm = torch.norm(x, dim=2)
-
+        
         return quaternion_norm
 
 
@@ -1097,35 +1176,35 @@ def main():
         os.makedirs(SAVE_DIR)
     
     # Constants for augmentation
-    NUM_AUGMENTATIONS = 1  # Reduced from 3 to 2
+    NUM_AUGMENTATIONS = 2  # Reduced from 3 to 2
     
     # Initialize logging
-    writer = SummaryWriter('runs/quaternion_cifar100')
+    writer = SummaryWriter('runs/quaternion_cifar10')
     metrics_logger = MetricsLogger(SAVE_DIR)
     
     # Get dataloaders with 2 augmentations
     train_loader, test_loader = get_data_loaders(
         batch_size=BATCH_SIZE,
         augmentations_per_image=NUM_AUGMENTATIONS,
-        num_workers=4,
-        dataset_type='cifar100'  # Specify CIFAR-100
+        num_workers=1,
+        dataset_type='cifar10'  # Specify CIFAR-100
     )
     
     # Keep QResNet34 with bottleneck blocks
-    model = QResNet34(num_classes=100, mapping_type='poincare', width_multiplier=1.5)
+    model = QResNet34(num_classes=10, mapping_type='poincare')
     
     # Print model parameter count
     num_params = count_parameters(model)
     print(f'\nTotal trainable parameters: {num_params:,}')
 
     # Add label smoothing to criterion
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    criterion = nn.CrossEntropyLoss()
     
     optimizer = torch.optim.SGD(
         model.parameters(), 
         lr=0.1,                
         momentum=0.9, 
-        weight_decay=5e-4,     
+        weight_decay=1e-4,     
         nesterov=True 
     )
 
@@ -1134,7 +1213,7 @@ def main():
     
     scheduler = torch.optim.lr_scheduler.MultiStepLR(
         optimizer,
-        milestones=[150, 225],
+        milestones=[50, 100],
         gamma=0.1,
     )
 
