@@ -1,5 +1,5 @@
 # QUAN: Quaternion Approximation Networks 
-
+## ![Please visit our newest repo](https://github.com/bryceag11/QUAN_ultralytics)
 A modular, configurable deep learning framework for training and evaluating quaternion neural networks on image classification and object detection datasets. This framework supports both standard convolutional neural networks and quaternion neural networks.
 
 ![figure2_poincare_visualization](https://github.com/user-attachments/assets/8b4b083b-d657-43cf-8cf5-a2d6cdb8af46)
